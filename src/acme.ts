@@ -109,7 +109,12 @@ export async function importAccountKeyPair(pem: string): Promise<CryptoKeyPair> 
     const forImport = normalized.includes("BEGIN EC PRIVATE KEY")
         ? sec1PemToPkcs8Pem(normalized)
         : normalized;
-    return CryptoKeyUtils.importKeyPairFromPemPrivateKey(forImport);
+    try {
+        return await CryptoKeyUtils.importKeyPairFromPemPrivateKey(forImport);
+    } catch (e: any) {
+        console.error("importKeyPairFromPemPrivateKey 失败:", e?.message ?? String(e));
+        throw e;
+    }
 }
 
 /** 根据订单加密类型推导证书密钥算法（finalize 时使用） */

@@ -294,3 +294,55 @@ npm run deploy-cf:test
 4. **账户首次创建**：新库 `createAccount` 不接收指定密钥，已用 `jwsFetch` 自实现「指定密钥建户」，
    需重点验证 EAB CA（Google/ZeroSSL/SSL.com）首次建户与后续登录两条路径。
 5. **吊销**：新库 roadmap 未内置 revoke，已用 `jwsFetch(revokeCert)` 自实现，需实测。
+
+---
+
+## 8. 账户密钥导入失败（getImportParameters）分析与下一步
+
+> 现象：部署后 `processOne error at flag=0: at getImportParameters (cfapp.js:10:513)
+> at Object.importKeyPairFromPemPrivateKey`。D1 读出的 PEM 看着正常，但导入时在
+> `getImportParameters` 崩溃。涉及 CA 账户密钥 `SSL_KeyTS` / `ZRO_KeyTS`。
+
+### 8.1 源码定位（已读 3 个库文件，未读 .d.ts）
+- `esm/CryptoKeyUtils/importKeyPairFromPemPrivateKey.js`：`getImportParameters` 在此（L27-52）。
+- `esm/utils/pem.js`：`extractFirstPemObject` 剥掉头尾 + 去空白 + base64 解码成 DER。
+- `esm/utils/crypto.js`：算法名/参数常量（`ec`=ECDSA、`rsa`=RSASSA-PKCS1-v1_5）。
+- 调用顺序：`importKeyPairFromPemPrivateKey(pem)` → `extractFirstPemObject(pem)` 得 DER →
+  `getImportParameters(DER)` **直接解 ASN.1** 读 `privateKeyAlgorithm`。
+  （文本层只用来取 DER；字符串格式本身在这一步已不再被读取。）
+
+### 8.2 `getImportParameters` 的 4 个抛出点
+- 外层 SEQUENCE 取不到第 2 个元素 → `Malformed PKCS#8 private key: missing privateKeyAlgorithm.`
+- AlgorithmIdentifier 取不到算法 OID → `Malformed PKCS#8 private key: empty AlgorithmIdentifier.`
+- EC 曲线缺失或 ≠ prime256v1 → `Unsupported EC curve in PEM private key. Only P-256 (prime256v1) is supported.`
+- 算法 OID 非 rsaEncryption / id-ecPublicKey → `Unsupported algorithm in PEM private key. Expected an EC (P-256) or RSA key.`
+- 注：堆栈来自 minify 后的 `cfapp.js`，`decodeSequence` 可能被内联进 `getImportParameters`，
+  故也可能表现为 ASN.1 解码错误。
+
+### 8.3 @fishballpkg/acme 对 PEM 的严格要求
+- 必须是真正的 **PKCS#8**（`BEGIN PRIVATE KEY`）；**不接受 SEC1**（`BEGIN EC PRIVATE KEY`）、
+  **PKCS#1**（`BEGIN RSA PRIVATE KEY`）、证书、`BEGIN ENCRYPTED PRIVATE KEY`。
+- 必须是 **EC P-256 或 RSA**：
+  - EC 曲线只支持 **P-256（prime256v1, OID 1.2.840.10045.3.1.7）**；
+    **P-384 / secp384r1 / secp256k1 / 显式域参数 EC 一律不支持**；
+  - RSA 仅接受 `rsaEncryption`（1.2.840.113549.1.1.1）。
+- 算法 / 曲线 OID 做**逐字节**比较；曲线必须是 AlgorithmIdentifier 的直接 namedCurve 参数。
+- `extractFirstPemObject` 只取**第一个** PEM 对象，body 必须为合法 base64。
+
+### 8.4 已做改动
+- `src/acme.ts` 的 `normalizePem`：字面量 `\n`/`\r\n` → 真实换行 + 去首尾空白（保留尾部换行）。
+- `importAccountKeyPair`：在调用 `importKeyPairFromPemPrivateKey` 前已加 `try-catch`，
+  失败时 `console.error("importKeyPairFromPemPrivateKey 失败:", e.message)` 后原样抛出，
+  便于部署后抓**精确错误文案**。
+
+### 8.5 下一步（新会话执行）
+1. 部署后触发一次 flag=0 申请，抓日志中的 `importKeyPairFromPemPrivateKey 失败: <e.message>`：
+   - `missing` / `empty` → DER 结构/解码问题（多半 key 不是 PKCS#8，或 body 有杂质）；
+   - `Unsupported algorithm` → 实际是 PKCS#1 / SEC1 / 证书 / RSA 变种 OID；
+   - `Unsupported EC curve` → 实际不是 P-256（很可能 P-384）。
+2. 验证实际密钥的真实曲线/算法：
+   ```bash
+   openssl pkey -in test.key -text -noout | findstr /i "oid"
+   ```
+   期望输出 `prime256v1`；若为 `secp384r1` 等则新库不支持，需更换密钥或改用受支持曲线。
+3. 依据结论决定修复方向（转换密钥格式/曲线，或改用受支持的账户密钥）。
