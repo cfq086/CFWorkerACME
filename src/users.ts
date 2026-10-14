@@ -3,7 +3,7 @@ import * as saves from './saves'
 import * as local from "hono/cookie";
 import {Resend} from "resend";
 import CryptoJS from "crypto-js";// @ts-ignore
-import {generateKeyPairSync} from "crypto";
+import {generateAccountKeyPem} from "./acme";
 
 
 // 获取种子 ###############################################################################
@@ -245,10 +245,6 @@ export async function userRegs(c: Context) {
             // console.log("pass_save:", pass_save);
 
 
-            const {publicKey, privateKey} = generateKeyPairSync(
-                'ec', {namedCurve: 'prime256v1'});
-            console.log(publicKey);
-
             // 新注册用户（flag 原为 0）需要初始化 quota 与 is_admin；
             // 重置密码路径（flag 已为 1）保留原 quota / is_admin，不被回溯。
             const isFreshRegister = Number(user_data_in["flag"] ?? 0) === 0;
@@ -265,7 +261,7 @@ export async function userRegs(c: Context) {
                 time: Date.now(),
             };
             if (!keep_keys) {
-                updates["keys"] = privateKey.export({type: 'pkcs8', format: 'pem'});
+                updates["keys"] = await generateAccountKeyPem();
             }
             if (isFreshRegister) {
                 try {

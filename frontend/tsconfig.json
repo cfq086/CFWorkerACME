@@ -23,7 +23,7 @@
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-
+    "ignoreDeprecations": "6.0", // <-- 加在这里
     /* Paths */
     "baseUrl": ".",
     "paths": {

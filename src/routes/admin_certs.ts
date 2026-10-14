@@ -14,7 +14,6 @@ import type {Bindings} from "../index";
 import {ensureDao} from "../db";
 import type {ApplyRow, QueryFilter, UserRow} from "../db/dao";
 import {adminMiddleware} from "../middleware/admin";
-import * as acme from "acme-client";
 
 const FLAG_SET = new Set([-1, 0, 1, 2, 3, 4, 5]);
 
@@ -128,9 +127,9 @@ export async function handleRevokeCert(c: Context<{ Bindings: Bindings }>): Prom
 
     // 尝试调用 ACME 吊销；不同 CA 的支持情况不同，失败时保留原状态
     try {
-        const {getAcmeClient} = await import("./admin_certs_helper");
-        const client = await getAcmeClient(c.env as any, user, row);
-        await client.revokeCertificate(row.cert);
+        const {getAcmeClient, revokeCertificate} = await import("./admin_certs_helper");
+        const {account} = await getAcmeClient(c.env as any, user, row);
+        await revokeCertificate(account, row.cert);
     } catch (e: any) {
         const msg = e?.message ?? String(e);
         console.error("[admin revoke] failed:", msg);

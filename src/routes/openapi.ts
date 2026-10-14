@@ -27,7 +27,7 @@ import type {ApplyRow, UserRow} from "../db/dao";
 import {checkApplyGuard} from "../middleware/applyGuard";
 import {buildStoredZip} from "../utils/zip";
 import {pemToPfxBuffer, splitCertChain} from "../utils/pfx";
-import {getAcmeClient} from "./admin_certs_helper";
+import {getAcmeClient, revokeCertificate} from "./admin_certs_helper";
 
 /** 解析鉴权头 */
 function parseAuth(c: Context): { mail: string; token: string } | null {
@@ -303,8 +303,8 @@ async function handleRevokeOrder(c: Context<{ Bindings: Bindings }>): Promise<Re
         return c.json({code: "NOT_READY", message: "仅对已签发的证书支持吊销"}, 400);
     }
     try {
-        const client = await getAcmeClient(c.env as any, user, row);
-        await client.revokeCertificate(row.cert);
+        const {account} = await getAcmeClient(c.env as any, user, row);
+        await revokeCertificate(account, row.cert);
     } catch (e: any) {
         return c.json({code: "REVOKE_FAILED", message: e?.message ?? "吊销失败"}, 500);
     }

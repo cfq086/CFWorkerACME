@@ -13,17 +13,15 @@ import type {Bindings} from "../index";
 import {ensureDao, normalizeDbSource, rawDao} from "../db";
 import {readBool, readConf, writeConf, invalidateConf} from "../db/conf";
 import CryptoJS from "crypto-js";
-// @ts-ignore - nodejs_compat 下 Cloudflare Workers 提供 crypto 模块
-import {generateKeyPairSync} from "crypto";
+import {generateAccountKeyPem} from "../acme";
 
 /**
  * 生成一条 ACME 账户私钥（EC prime256v1 / PKCS#8 PEM）。
  * 与 src/users.ts `userRegs` 保持一致的算法与导出格式，
  * 供初始化向导创建 / 升级管理员账号时写入 Users.keys。
  */
-function createAcmeAccountKeyPem(): string {
-    const {privateKey} = generateKeyPairSync("ec", {namedCurve: "prime256v1"});
-    return privateKey.export({type: "pkcs8", format: "pem"}) as string;
+async function createAcmeAccountKeyPem(): Promise<string> {
+    return await generateAccountKeyPem();
 }
 
 /**
@@ -278,7 +276,7 @@ export async function handleSetup(c: Context<{ Bindings: Bindings }>): Promise<R
                 time: Date.now(),
             };
             if (!keepKeys) {
-                patch.keys = createAcmeAccountKeyPem();
+                patch.keys = await createAcmeAccountKeyPem();
             }
             await dao.updateUser(adminMail, patch);
         } else {
@@ -288,7 +286,7 @@ export async function handleSetup(c: Context<{ Bindings: Bindings }>): Promise<R
                 is_admin: 1,
                 pass: passStored,
                 quota: -1,
-                keys: createAcmeAccountKeyPem(),
+                keys: await createAcmeAccountKeyPem(),
                 apis: randomToken(16),
                 time: Date.now(),
             });
