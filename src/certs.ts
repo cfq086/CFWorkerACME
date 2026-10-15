@@ -161,6 +161,7 @@ export async function processOne(env: Bindings, order_uuid: string) {
         } catch (e) {
             const msg = extractAcmeError(e);
             console.error("processOne error at flag=" + flag + ":", e);
+            console.error("抛错5: ", extractAcmeError(e));
             // 将错误信息持久化到订单，供前端展示
             try {
                 await saves.updateDB(env.DB_CF, "Apply",
@@ -312,7 +313,49 @@ export async function opDomain(env: Bindings, order_user: any, order_info: any, 
     return {"texts": "处理成功"};
 }
 
+// 复核域名在 CA 侧的挑战真实状态 ##################################################################
+// 用途：区分"终态失败"与"仍在验证中"。只做读取，不触发任何状态变更。
+// 挑挑战的优先级与 getAuthy 保持一致（dns-01 优先，其次 http-01）。
+// 返回：挑战 status 字符串；查不到（网络异常/域名不存在）返回 ""。
+async function peekChallengeStatus(client_data: any, orders_text: any, domain_name: string) {
+    try {
+        let orders_data: any = await client_data.getOrder(orders_text);
+        let author_list: any[] = await client_data.getAuthorizations(orders_data);
+        for (const author_data of author_list) {
+            let author_name: string = author_data['identifier'] ? author_data['identifier']['value'] : "";
+            if (author_data['wildcard'] === true) author_name = "*." + author_name;
+            if (author_name !== domain_name) continue;
+            let challenges: any[] = author_data['challenges'] || [];
+            let picked: any = undefined;
+            for (const c of challenges) if (c.type === "dns-01") { picked = c; break; }
+            if (picked === undefined) for (const c of challenges) if (c.type === "http-01") { picked = c; break; }
+            if (picked) return String(picked['status'] || "");
+            return "";
+        }
+    } catch (e) {
+        console.error('peekChallengeStatus failed:', e);
+    }
+    return "";
+}
+
 // 执行域名验证 ====================================================================================
+// 挑战状态机（RFC 8555 §7.1.6）—— 本函数是唯一的判定点，语义显式：
+//   valid      → CA 已完成，该域名推进到 flag=4（进入签发阶段）
+//   invalid    → 终态失败，规范禁止重试，该域名置 flag=-1，必须重新申请
+//   processing → 已触发，CA 正在核验。**只能"继续等"**：规范只允许对 pending 挑战发起触发，
+//                重复提交是非法操作；且本轮开头的 getAuthy 已取到最新状态，无需再同步轮询
+//                → 保持 flag=3，交由下一次触发 / 定时任务继续推进
+//   pending    → 尚未触发，需要提交。**只有这一步才做本地 DNS 校验**（dnsCheck）：
+//                本地未就绪 → flag=2「待验证」；本地就绪 → verifyChallenge + completeChallenge
+//                + waitForValidStatus
+//   其它/未知  → 保守处理：不推进、不判失败，保持"验证中"
+// 两条核心原则：
+//   ① **CA 的真实状态优先于本地 DNS 校验** —— 挑战已是 valid/invalid/processing 时，
+//      本地 TXT 是否还在与判定无关（例如验证通过后清理了 DCV 记录），
+//      绝不能用本地 dnsCheck 的结果把 CA 已完成的订单打回 flag=2。
+//   ② **非终态失败不判死** —— 只有 CA 明确判 invalid 才置 -1；其余失败按
+//      "尚未提交成功 → 2 / 已提交但未定终态 → 3" 分类，避免误杀健康订单。
+// 订单级 flag 由循环结束后按显式规则汇总（见函数末尾），不再依赖 status_flag 初值隐式推进到 4。
 export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) {
     let domain_list: any = order_info['list'];
     let orders_text: any = JSON.parse(order_info['data'])
@@ -321,43 +364,72 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
     let author_save: Record<string, Record<string, any>> = await getAuthy(client_data, orders_data)
     // 验证所有域名 ================================================================================
     let domain_save: any[] = [] // 需要最后保存的域名详细验证数据
-    let status_flag: number = 4;
-    let domain_fail: string[] = [];
+    let domain_fail: string[] = [];    // 终态失败原因（写入订单 text）
+    let domain_pending: string[] = []; // 「待验证」原因（写入订单 text）
+    let domain_wait: string[] = [];    // 「验证中」原因（写入订单 text）
+    let status_fail: boolean = false;     // 是否出现终态失败（-1）
+    let status_pending: boolean = false;  // 是否有域名处于「待验证」（2）
     for (let domain_item of JSON.parse(domain_list)) { // 验证DNS
-        // web-self（http-01验证）不需要DNS检查，直接提交验证
-        let author_flag: boolean = domain_item.type === "web-self"
-            ? (author_save[domain_item.name] != undefined)
-            : await dnsCheck(author_save, domain_item)
-        if (status_flag == -1) {
+        if (status_fail) { // 已出现终态失败：其余域名只落库，不再发起 CA 请求
             domain_save.push(domain_item);
             continue
         }
-        console.log(domain_item.name, author_flag);
-        if (!author_flag) { // 本地验证失败 ========================================================
+        let author_data: Record<string, any> = author_save[domain_item.name]
+        // 未取到挑战（该域名没拿到 dns-01 / http-01）→ 本地未就绪，等下次重试，不是终态失败
+        if (author_data == undefined) {
+            console.log(domain_item.name, false);
             domain_item.flag = 2;
-            status_flag = 2
-        } else { // 本地验证成功 =====================================================================
-            let author_data: Record<string, any> = author_save[domain_item.name]
-            if (author_data.data['status'] == "invalid") { // 已有验证失败
-                // 在 CA 侧已是终态 invalid（RFC 8555 规定不可重试，必须新建订单）
-                console.log('抛错:Challenge Already Invalid:', domain_item.name,
-                    JSON.stringify(author_data.data));
-                domain_fail.push(domain_item.name + ": 已被 CA 标记为 invalid（不可重试，需重新申请）");
-                domain_item.flag = -1;
-                status_flag = -1;
-            }
-            if (author_data.data['status'] == 'pending') {
+            status_pending = true;
+            domain_pending.push(domain_item.name + ": 未获取到验证挑战");
+            domain_save.push(domain_item);
+            continue
+        }
+        let challenge_status: string = String(author_data.data['status'] || "");
+        console.log('挑战状态:', domain_item.name, challenge_status);
+        // ① CA 的真实状态优先于本地 DNS 校验 ==========================================================
+        if (challenge_status == "valid") { // CA 已完成 ================================================
+            domain_item.flag = 4;
+        } else if (challenge_status == "invalid") { // 终态失败 =========================================
+            console.log('抛错:Challenge Already Invalid:', domain_item.name,
+                JSON.stringify(author_data.data));
+            domain_fail.push(domain_item.name + ": 已被 CA 标记为 invalid（不可重试，需重新申请）");
+            domain_item.flag = -1;
+            status_fail = true;
+        } else if (challenge_status == "processing") { // 已提交，只能"继续等" ==========================
+            // RFC 8555 §7.1.6：只有 pending 状态的挑战可以被触发，重复 POST 属非法操作
+            // → **绝不重新提交**。
+            // 也不在这里同步轮询：本轮开头的 getAuthy 取到的就是最新状态，
+            // 能秒级定终态的 CA 早在上一轮 pending 分支的轮询里就返回了，
+            // 再同步等 3.5 分钟收益极低，而长轮询正是此前"订单卡在验证中"的成因。
+            // 语义 = "继续等"：保持 flag=3，交由下一次触发 / 定时任务继续推进。
+            console.log('验证2:Domain Remote Upload Status: 跳过重复提交（挑战已在 processing，规范只允许 pending 触发）');
+            domain_wait.push(domain_item.name + ": CA 仍在核验（processing）");
+        } else if (challenge_status == "pending") { // 尚未触发：只有这里才做本地校验 ===================
+            // web-self（http-01验证）不需要DNS检查，直接提交验证
+            let author_flag: boolean = domain_item.type === "web-self"
+                ? true : await dnsCheck(author_save, domain_item)
+            console.log(domain_item.name, author_flag);
+            if (!author_flag) {
+                // 本地看不到 TXT/CNAME = DNS 尚未生效，等用户处理；这不是终态失败
+                domain_item.flag = 2;
+                status_pending = true;
+                domain_pending.push(domain_item.name + ": 本地未查到 _acme-challenge 记录");
+            } else {
+                let submitted: boolean = false; // completeChallenge 是否已成功提交
                 try {
                     let upload_flag: boolean = await client_data.verifyChallenge(author_data.auth, author_data.data);
-                    console.log('验证1:Domain Server Verify Status:', upload_flag,JSON.stringify(upload_flag));
+                    console.log('验证1:Domain Server Verify Status:', upload_flag, JSON.stringify(upload_flag));
                     let submit_flag = await client_data.completeChallenge(author_data.data);
-                    console.log('验证2:Domain Remote Upload Status:', submit_flag['status'],JSON.stringify(submit_flag));
+                    submitted = true;
+                    console.log('验证2:Domain Remote Upload Status:', submit_flag['status'], JSON.stringify(submit_flag));
 
                     let result_flag = await client_data.waitForValidStatus(author_data.data);
                     console.log('验证3:Domain Remote Verify Status:', result_flag['status'], JSON.stringify(result_flag));
-
                     if (result_flag && result_flag.status == "valid") {
                         domain_item.flag = 4;
+                    } else {
+                        // 拿到返回但不是 valid：按"仍在验证中"处理，不推进
+                        domain_wait.push(domain_item.name + ": " + String(result_flag && result_flag.status));
                     }
                 } catch (error: any) {
                     // 把 CA 返回的真实原因取出来（此前只打了 Error 对象，
@@ -369,17 +441,44 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
                     console.log('抛错1:Domain Remote Verify Reason:', reason);
                     console.log('抛错2:Domain Remote Verify Raw:', extractAcmeError(error));
                     console.log('抛错3:Domain Remote Verify Error:', error);
-                    domain_fail.push(domain_item.name + ": " + reason);
-                    domain_item.flag = -1;
-                    status_flag = -1;
+                    // 失败分类（不再一律置 -1）：只有 CA 明确判 invalid 才是终态失败。
+                    //   ① CA 判 invalid → -1（真失败，必须重新申请）
+                    //   ② 尚未提交成功（verifyChallenge / completeChallenge 失败）→ 2「待验证」：
+                    //      CA 侧挑战多半仍是 pending，订单并没有死，可以重试
+                    //   ③ 已提交但未定终态（等待超时 / 非 200 / 网络中断）→ 3「验证中」，绝不误杀
+                    const remote_status = await peekChallengeStatus(client_data, orders_text, domain_item.name);
+                    if (remote_status === "invalid") {
+                        domain_fail.push(domain_item.name + ": " + reason);
+                        domain_item.flag = -1;
+                        status_fail = true;
+                    } else if (!submitted) {
+                        console.log('抛错:Domain Remote Verify 尚未提交成功，回到「待验证」；CA 侧状态:', remote_status || "(未取到)");
+                        domain_item.flag = 2;
+                        status_pending = true;
+                        domain_pending.push(domain_item.name + ": " + reason);
+                    } else {
+                        console.log('抛错:Domain Remote Verify 已提交但未定终态，保持「验证中」；CA 侧状态:', remote_status || "(未取到)");
+                        domain_wait.push(domain_item.name + ": " + reason);
+                    }
                 }
             }
-            if (author_data.data['status'] == 'valid') {
-                domain_item.flag = 4;
-            }
+        } else { // 未知状态：保守处理，不推进、不判失败 =================================================
+            console.log('警告:Challenge Unknown Status:', domain_item.name, JSON.stringify(author_data.data));
+            domain_wait.push(domain_item.name + ": 未知挑战状态 " + JSON.stringify(challenge_status));
         }
         domain_save.push(domain_item);
     }
+    // 订单级 flag 汇总（显式规则，取代原先"status_flag 初值=4"的隐式推进）===========================
+    //   -1 : 任一域名终态失败
+    //    2 : 有域名处于「待验证」（本地未就绪 / 尚未提交成功）
+    //    4 : 所有域名均已通过验证（全部 domain_item.flag >= 4）
+    //    3 : 其余情况 —— 仍有域名在 CA 侧等待（pending/processing/未知），保持"验证中"
+    let status_flag: number;
+    if (status_fail) status_flag = -1;
+    else if (status_pending) status_flag = 2;
+    else if (domain_save.length > 0 && domain_save.every((d: any) => Number(d.flag) >= 4)) status_flag = 4;
+    else status_flag = 3;
+
     orders_data = await client_data.getOrder(orders_text);
     // console.log(orders_data);
     await saves.updateDB(env.DB_CF, "Apply", {data: JSON.stringify(orders_data)}, {uuid: order_info['uuid']})
@@ -387,6 +486,13 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
     await saves.updateDB(env.DB_CF, "Apply", {flag: status_flag}, {uuid: order_info['uuid']})
     if (status_flag == -1) await saves.updateDB(env.DB_CF, "Apply", {
         text: "域名验证失败:" + JSON.stringify(domain_fail)
+    }, {uuid: order_info['uuid']})
+    else if (status_flag == 2) await saves.updateDB(env.DB_CF, "Apply", {
+        text: "待验证" + (domain_pending.length > 0 ? "：" + JSON.stringify(domain_pending) : "") + "，请处理后重试"
+    }, {uuid: order_info['uuid']})
+    else if (status_flag == 3) await saves.updateDB(env.DB_CF, "Apply", {
+        text: "域名验证中：CA 仍在核验" +
+            (domain_wait.length > 0 ? " —— " + JSON.stringify(domain_wait) : "") + "，请稍后重试"
     }, {uuid: order_info['uuid']})
     else await saves.updateDB(env.DB_CF, "Apply", {text: "域名验证通过"}, {uuid: order_info['uuid']})
     return {"texts": "处理成功"};
