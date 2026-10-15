@@ -5,8 +5,9 @@
  *
  * 目标：
  *   1. Users 表补齐 is_admin / quota 字段（若已存在则跳过）。
- *   2. 新建 Confs 表（key-value 配置）。
- *   3. 播种默认配置项（仅在 Confs 中首次不存在时插入）。
+ *   2. Apply 表补齐 lock_until 字段（订单处理租约，若已存在则跳过）。
+ *   3. 新建 Confs 表（key-value 配置）。
+ *   4. 播种默认配置项（仅在 Confs 中首次不存在时插入）。
  *
  * 本脚本通过统一 DAO 适配层执行，避免与 DB_SOURCE 绑定。
  * 每次 Worker 首次请求到达时调用 `runMigrations(dao)` 即可，内部做了单次标记。
@@ -68,6 +69,16 @@ const DEFAULT_CONFS: Record<string, string> = {
     ZRO_keyMC: "",
     ZRO_keyID: "",
     ZRO_KeyTS: "",
+    // 定时任务 / 订单锁 ------------------------------------------------
+    // 自动续期阈值：证书剩余有效期小于该天数即触发续签
+    CRON_RENEW_DAYS: "30",
+    // DCV 记录保留天数，超过即清理（同时终止仍卡在验证的订单）
+    DCV_KEEP_DAYS: "7",
+    // 订单处理租约时长（毫秒）。必须大于单次 invocation 的最坏耗时，
+    // 否则会出现"上一个 invocation 还在跑、锁已过期被下一个抢走"的情况。
+    ORDER_LOCK_MS: "300000",
+    // 单轮自动推进最多处理的订单数（防止耗尽子请求配额；免费计划建议 3~4）
+    PROCESS_MAX_ORDERS: "10",
 };
 
 // 模块级标记：避免在同一 Worker 实例中重复迁移。
@@ -83,6 +94,7 @@ export async function runMigrations(dao: Dao): Promise<void> {
         await ensureConfsTable(dao);
         await ensureBaseTables(dao);
         await ensureUsersColumns(dao);
+        await ensureApplyColumns(dao);
         await seedDefaultConfs(dao);
         _migrated = true;
     } catch (e) {
@@ -135,7 +147,8 @@ async function ensureBaseTables(dao: Dao): Promise<void> {
         "keys TEXT, " +
         "cert TEXT, " +
         "data TEXT, " +
-        "text TEXT)"
+        "text TEXT, " +
+        "lock_until INTEGER NOT NULL DEFAULT 0)"
     );
 }
 
@@ -156,6 +169,23 @@ async function ensureUsersColumns(dao: Dao): Promise<void> {
     if (!cols.includes("quota")) {
         await dao.exec(
             "ALTER TABLE Users ADD COLUMN quota INTEGER NOT NULL DEFAULT -1"
+        );
+    }
+}
+
+/**
+ * 检查 Apply 表是否已含 lock_until 字段（订单处理租约），缺则 ALTER TABLE 补齐。
+ * 与 ensureUsersColumns 同样先查列名集合再决定是否 ALTER
+ * （SQLite / D1 不支持 `ADD COLUMN IF NOT EXISTS`）。
+ *
+ * lock_until 语义：毫秒时间戳，表示"该订单被某个 invocation 持有的截止时间"。
+ *   0 或小于当前时间 = 空闲可抢；大于当前时间 = 有人正在处理。
+ */
+async function ensureApplyColumns(dao: Dao): Promise<void> {
+    const cols = await dao.columns("Apply");
+    if (!cols.includes("lock_until")) {
+        await dao.exec(
+            "ALTER TABLE Apply ADD COLUMN lock_until INTEGER NOT NULL DEFAULT 0"
         );
     }
 }

@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS Apply
     keys TEXT,
     cert TEXT,
     data TEXT,
-    text TEXT
+    text TEXT,
+    lock_until INTEGER NOT NULL DEFAULT (0)
 );
 
 CREATE TABLE IF NOT EXISTS Confs

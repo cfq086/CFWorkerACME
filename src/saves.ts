@@ -71,7 +71,17 @@ export async function insertDB(
     return await (DB as any).prepare(sql).bind(...Object.values(values)).run();
 }
 
-/** 查询数据（兼容旧签名 {col: {value, op}}） */
+/**
+ * 允许拼进 SQL 的比较运算符白名单。
+ * 注意：`op` 来自调用方代码而非用户输入，但仍走白名单，避免字符串拼接被注入。
+ */
+const CMP_OPS = new Set(["<", "<=", ">", ">="]);
+
+/**
+ * 查询数据（兼容旧签名 `{col: {value, op}}`）。
+ * 支持的操作符：`=`（默认）、`!=`、`LIKE`、`NOT LIKE`、`<`、`<=`、`>`、`>=`。
+ * 每个列只能给一个条件；同一列的多条件请自行用范围/JS 过滤。
+ */
 export async function selectDB(
     DB: D1Database, table: string,
     where: SelectWhere
@@ -88,6 +98,10 @@ export async function selectDB(
             params.push(`%${c.value}%`);
         } else if (op === "!=") {
             conditions.push(`${k} != ?`);
+            params.push(c.value);
+        } else if (CMP_OPS.has(op)) {
+            // 比较运算符：自动续期（next <= now）、订单锁超时判断等场景需要
+            conditions.push(`${k} ${op} ?`);
             params.push(c.value);
         } else {
             conditions.push(`${k} = ?`);
