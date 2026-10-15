@@ -339,22 +339,37 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
         } else { // 本地验证成功 =====================================================================
             let author_data: Record<string, any> = author_save[domain_item.name]
             if (author_data.data['status'] == "invalid") { // 已有验证失败
+                // 在 CA 侧已是终态 invalid（RFC 8555 规定不可重试，必须新建订单）
+                console.log('抛错:Challenge Already Invalid:', domain_item.name,
+                    JSON.stringify(author_data.data));
+                domain_fail.push(domain_item.name + ": 已被 CA 标记为 invalid（不可重试，需重新申请）");
                 domain_item.flag = -1;
                 status_flag = -1;
             }
             if (author_data.data['status'] == 'pending') {
                 try {
                     let upload_flag: boolean = await client_data.verifyChallenge(author_data.auth, author_data.data);
-                    console.log('Domain Server Verify Status:', upload_flag);
+                    console.log('验证1:Domain Server Verify Status:', upload_flag,JSON.stringify(upload_flag));
                     let submit_flag = await client_data.completeChallenge(author_data.data);
-                    console.log('Domain Remote Upload Status:', submit_flag['status']);
+                    console.log('验证2:Domain Remote Upload Status:', submit_flag['status'],JSON.stringify(submit_flag));
+
                     let result_flag = await client_data.waitForValidStatus(author_data.data);
-                    console.log('Domain Remote Verify Status:', result_flag['status']);
-                    if (result_flag.status == "valid") {
+                    console.log('验证3:Domain Remote Verify Status:', result_flag['status'], JSON.stringify(result_flag));
+
+                    if (result_flag && result_flag.status == "valid") {
                         domain_item.flag = 4;
                     }
-                } catch (error) {
-                    console.log('Domain Remote Verify Errors:', error);
+                } catch (error: any) {
+                    // 把 CA 返回的真实原因取出来（此前只打了 Error 对象，
+                    // Cloudflare 日志只渲染 stack，message 被淹没）。
+                    // waitForValidStatus 抛出的 Error.message 就是 ACME Problem Details 的 detail
+                    // （见 acme-client util.formatResponseError）；其它错误用 extractAcmeError 兜底。
+                    const reason: string = (error && error.message)
+                        ? String(error.message) : extractAcmeError(error);
+                    console.log('抛错1:Domain Remote Verify Reason:', reason);
+                    console.log('抛错2:Domain Remote Verify Raw:', extractAcmeError(error));
+                    console.log('抛错3:Domain Remote Verify Error:', error);
+                    domain_fail.push(domain_item.name + ": " + reason);
                     domain_item.flag = -1;
                     status_flag = -1;
                 }
