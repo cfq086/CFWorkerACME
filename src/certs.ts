@@ -95,7 +95,84 @@ export function extractAcmeError(e: any): string {
     }
 }
 
+// 订单级 CAS 租约锁 ===============================================================================
+// 目的：手动触发（`/order/?op=process`）与 cron 自动推进（`Processing`）可能同时命中同一订单。
+// 做法：用 D1 自身的**单条原子 UPDATE** 做 CAS —— D1 单库单线程逐条执行，天然互斥，
+//      不需要引入 Durable Object 之类的额外组件。
+
+/** 默认租约时长（毫秒）；实际取值由配置 `ORDER_LOCK_MS` 决定 */
+const ORDER_LOCK_DEFAULT_MS = 300000;
+
+/**
+ * 尝试取锁。取锁是**单条原子语句**：
+ *
+ * ```sql
+ * UPDATE Apply SET lock_until = <now + lease>
+ *  WHERE uuid = ? AND (lock_until IS NULL OR lock_until < now)
+ * ```
+ *
+ * 只有影响到 1 行才算抢到。
+ *
+ * 为什么用"租约"而不是布尔标志：`lock_until` 是绝对时间戳，即使持有者被平台杀掉
+ * （15 分钟 invocation 上限 / 客户端断连），锁也会自动过期，不会永久卡死。
+ *
+ * @returns 抢到时返回写入的 `lock_until` 值（释放时要用它校验持有者），没抢到返回 0
+ */
+async function acquireOrderLock(env: Bindings, uuid: string, leaseMs: number): Promise<number> {
+    const now: number = Date.now();
+    // +0~999ms 抖动：下面的读回校验兜底靠"值是否等于自己写进去的"来判断抢没抢到，
+    // 若两个调用在同一毫秒算出同一个 until 就会误判为抢到。抖动让值几乎不可能撞车。
+    const until: number = now + Math.max(1000, leaseMs) + Math.floor(Math.random() * 1000);
+    const sql: string =
+        "UPDATE Apply SET lock_until = ? WHERE uuid = ? AND (lock_until IS NULL OR lock_until < ?)";
+    try {
+        const res: any = await (env.DB_CF as any).prepare(sql).bind(until, uuid, now).run();
+        const changes: number = Number(res?.meta?.changes ?? -1);
+        if (changes >= 0) return changes === 1 ? until : 0;
+        // 个别运行环境不返回 meta.changes → 读回校验兜底（值等于我们刚写进去的才算抢到）
+        console.error("[orderLock] meta.changes 不可用，改用读回校验:", uuid);
+    } catch (e) {
+        console.error("[orderLock] 取锁失败:", uuid, e);
+        return 0;
+    }
+    const cur: any = (await saves.selectDB(env.DB_CF, "Apply", {uuid: {value: uuid}}))[0];
+    return (cur && Number(cur['lock_until']) === until) ? until : 0;
+}
+
+/**
+ * 释放锁。带 `lock_until = until` 条件，确保**只释放自己持有的那把**
+ * （若租约已过期并被别人接管，不会误清掉对方的锁）。
+ */
+async function releaseOrderLock(env: Bindings, uuid: string, until: number): Promise<void> {
+    if (!until) return;
+    try {
+        await saves.updateDB(env.DB_CF, "Apply", {lock_until: 0}, {uuid, lock_until: until});
+    } catch (e) {
+        console.error("[orderLock] 释放锁失败:", uuid, e);
+    }
+}
+
+/**
+ * 在订单锁保护下执行 `fn`。
+ * 取不到锁时返回 `{locked: false}`，由调用方决定怎么反馈（cron 跳过 / 手动提示"处理中"）。
+ */
+async function withOrderLock<T>(
+    env: Bindings, uuid: string, fn: () => Promise<T>
+): Promise<{ locked: boolean; value?: T }> {
+    const leaseMs: number = await readInt(env, "ORDER_LOCK_MS", ORDER_LOCK_DEFAULT_MS);
+    const until: number = await acquireOrderLock(env, uuid, leaseMs);
+    if (!until) return {locked: false};
+    try {
+        return {locked: true, value: await fn()};
+    } finally {
+        await releaseOrderLock(env, uuid, until);
+    }
+}
+
 // 整体处理进程 ====================================================================================
+// ⚠️ 锁是**订单级**粒度：每个订单各自取锁/释放，所以一轮 cron 不会长时间占着一把大锁。
+// ⚠️ **不要在 `opDomain` 内部再加锁** —— 它的 `dnsAuthy` 调用点只从本函数进入（已在锁内），
+//    重复加锁会因租约未过期而取锁失败，等于把自己锁死。
 export async function Processing(env: Bindings) {
     let order_list: any = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5, op: "!="}});
     let result: any[] = []
@@ -104,11 +181,22 @@ export async function Processing(env: Bindings) {
         let order_mail = order_info['mail']; // 当前订单用户邮箱
         let order_user: any = (await saves.selectDB( // 查询申请者信息
             env.DB_CF, "Users", {mail: {value: order_mail}}))[0]; // 按不同阶段分配程序处理 ========================
-        if (order_info['flag'] == 0) result.push(await newApply(env, order_user, order_info));// 执行创建订单操作
-        if (order_info['flag'] == 1) result.push(await setApply(env, order_user, order_info));// 自动执行域名代理
-        if (order_info['flag'] == 2) result.push(await opDomain(env, order_user, order_info, []));// 自动验证域名
-        if (order_info['flag'] == 3) result.push(await dnsAuthy(env, order_user, order_info));// 自动执行域名验证
-        if (order_info['flag'] == 4) result.push(await getCerts(env, order_user, order_info));// 自动执行获取证书
+        // 订单级 CAS 租约锁：取不到说明另一个 invocation（手动点击 / 上一轮 cron）正在处理它
+        const locked = await withOrderLock(env, String(order_info['uuid']), async () => {
+            if (order_info['flag'] == 0) return await newApply(env, order_user, order_info);// 执行创建订单操作
+            if (order_info['flag'] == 1) return await setApply(env, order_user, order_info);// 自动执行域名代理
+            if (order_info['flag'] == 2) return await opDomain(env, order_user, order_info, []);// 自动验证域名
+            if (order_info['flag'] == 3) return await dnsAuthy(env, order_user, order_info, 0);// 自动执行域名验证（cron 不等待）
+            if (order_info['flag'] == 4) return await getCerts(env, order_user, order_info);// 自动执行获取证书
+            return undefined;
+        });
+        if (!locked.locked) {
+            console.log("[Processing] 订单正被处理，本轮跳过:", order_info['uuid']);
+            result.push({"uuid": order_info['uuid'], "texts": "订单正在处理中，本轮跳过", "skipped": true});
+            continue;
+        }
+        // 未知 flag（如 -1）没有对应处理分支，不往结果里塞 undefined
+        if (locked.value !== undefined) result.push(locked.value);
     } // ========================================================================================================
     return result;
 }
@@ -120,14 +208,13 @@ export async function Processing(env: Bindings) {
 // - flag=-1 失败
 // - 或中间某步 flag 未发生变化（避免死循环）
 //
-// 注意：本函数只被**手动入口**调用（`POST /apply/`、`GET /order/?op=process`）。
-// cron 自动推进走 `Processing()`，不经过这里，因此默认带"有界短轮询"预算是安全的。
+// ⚠️ 本函数是**内部实现**，调用方必须已经持有订单锁（见下方的 `processOne`）。
 //
-// @param wait_ms 透传给 dnsAuthy 的有界等待预算；不传则读 `MANUAL_WAIT_MS`（默认 60000）
-export async function processOne(env: Bindings, order_uuid: string, wait_ms?: number) {
+// @param manual_wait_ms 透传给 dnsAuthy 的有界等待预算
+async function processOneLocked(
+    env: Bindings, order_uuid: string, manual_wait_ms: number
+): Promise<any[]> {
     let result: any[] = [];
-    const manual_wait_ms: number = (wait_ms === undefined)
-        ? await readInt(env, "MANUAL_WAIT_MS", 60000) : wait_ms;
     // 自愈检查：订单已创建（data 存在）但 list 中某些域名 auth 缺失，则强制回到 flag=1 重跑 setApply
     {
         let cur: any = (await saves.selectDB(
@@ -186,6 +273,29 @@ export async function processOne(env: Bindings, order_uuid: string, wait_ms?: nu
         if (!next_info || Number(next_info['flag']) === flag) break;
     }
     return result;
+}
+
+/**
+ * 单订单一键推进（**手动入口**：`POST /apply/`、`GET /order/?op=process`）。
+ *
+ * 整段推进（含自愈）都在**订单锁**内执行：拿不到锁说明另一个 invocation
+ * （cron 或另一次手动点击）正在处理该订单，此时不等待、不排队，
+ * 直接返回 `{locked: false}`，由路由层提示"订单正在处理中"。
+ *
+ * cron 自动推进走 `Processing()`，不经过这里，因此默认带"有界短轮询"预算是安全的。
+ *
+ * @param wait_ms 有界等待预算；不传则读 `MANUAL_WAIT_MS`（默认 60000）
+ * @returns `{locked, results}`；`locked === false` 表示没抢到锁、本轮什么都没做
+ */
+export async function processOne(
+    env: Bindings, order_uuid: string, wait_ms?: number
+): Promise<{ locked: boolean; results: any[] }> {
+    const manual_wait_ms: number = (wait_ms === undefined)
+        ? await readInt(env, "MANUAL_WAIT_MS", 60000) : wait_ms;
+    const locked = await withOrderLock<any[]>(
+        env, order_uuid, () => processOneLocked(env, order_uuid, manual_wait_ms));
+    if (!locked.locked) console.log("[processOne] 订单正被处理，跳过:", order_uuid);
+    return {locked: locked.locked, results: locked.value ?? []};
 }
 
 // 新增证书订单 =====================================================================================

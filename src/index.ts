@@ -131,12 +131,15 @@ app.use('/apply/', async (c: Context): Promise<Response> => {
         // 若推进失败（如 ACME 服务端拒绝），把错误原因回显给前端，便于用户即时看到失败原因
         let apply_warn: string | null = null;
         try {
-            await certs.processOne(c.env, uuid);
+            const proc = await certs.processOne(c.env, uuid);
             // 再查一次订单，如果已经被置为失败状态（flag=-1），把 text 作为警告返回
             const fresh: any = await saves.selectDB(
                 c.env.DB_CF, "Apply", {uuid: {value: uuid}});
             if (fresh && fresh[0] && Number(fresh[0].flag) < 0) {
                 apply_warn = String(fresh[0].text || "证书申请处理失败");
+            } else if (!proc.locked) {
+                // 新订单理论上不会被别人锁住；真发生了就如实告知，别假装推进成功
+                apply_warn = "订单正在处理中，请稍后到订单列表刷新";
             }
         } catch (e) {
             const {extractAcmeError} = await import("./certs");
@@ -233,7 +236,14 @@ app.use('/order/', async (c: Context): Promise<Response> => {
                         c.env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
                     await opDomain(c.env, order_user, fresh_info, ["all"]);
                 }
-                await certs.processOne(c.env, order_uuid);
+                const proc = await certs.processOne(c.env, order_uuid);
+                if (!proc.locked) {
+                    // 另一个 invocation（cron / 另一次点击）正在处理该订单
+                    // → 如实告知，而不是静默返回"执行操作成功"让用户以为点了没反应
+                    return c.json({
+                        "flags": 0, "texts": "订单正在处理中，请稍后刷新", "order": order_acts,
+                    });
+                }
             } else if (order_acts === "reload")
                 await saves.updateDB(c.env.DB_CF, "Apply", {flag: 0}, {uuid: order_uuid})
             else if (order_acts === "modify" || order_acts === "cancel")
