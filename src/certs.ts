@@ -104,6 +104,12 @@ export function extractAcmeError(e: any): string {
 const ORDER_LOCK_DEFAULT_MS = 300000;
 
 /**
+ * `Processing()` 单轮的时间预算（毫秒）。
+ * `scheduled()` 有 15 分钟 duration 上限，这里留足余量；超预算就停，剩余订单留给下一轮。
+ */
+const PROCESS_BUDGET_MS = 5 * 60 * 1000;
+
+/**
  * 尝试取锁。取锁是**单条原子语句**：
  *
  * ```sql
@@ -170,13 +176,38 @@ async function withOrderLock<T>(
 }
 
 // 整体处理进程 ====================================================================================
+// 供 cron（自动推进）与 `/tests/`、`/tasks/` 调用。
+//
 // ⚠️ 锁是**订单级**粒度：每个订单各自取锁/释放，所以一轮 cron 不会长时间占着一把大锁。
 // ⚠️ **不要在 `opDomain` 内部再加锁** —— 它的 `dnsAuthy` 调用点只从本函数进入（已在锁内），
 //    重复加锁会因租约未过期而取锁失败，等于把自己锁死。
-export async function Processing(env: Bindings) {
-    let order_list: any = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5, op: "!="}});
+//
+// 单轮上限（G8）：`scheduled()` 有 15 分钟 duration 上限，而每个订单的处理耗时不可控
+// （还要受子请求配额约束，免费计划只有 50）。所以这里同时限制**订单数**与**总耗时**，
+// 超出的订单留给下一轮。
+export async function Processing(env: Bindings, opts?: { maxOrders?: number; budgetMs?: number }) {
+    const maxOrders: number = opts?.maxOrders ?? await readInt(env, "PROCESS_MAX_ORDERS", 10);
+    const budgetMs: number = opts?.budgetMs ?? PROCESS_BUDGET_MS;
+    const startedAt: number = Date.now();
+
+    let order_list: any[] = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5, op: "!="}});
+    // 只处理 flag >= 0 的（-1 是终态失败，处理它只会白占预算）；
+    // 按 time 升序 = 最老的订单优先，避免订单多时后面的永远轮不到。
+    order_list = order_list
+        .filter((o: any) => Number(o?.['flag']) >= 0)
+        .sort((a: any, b: any) => Number(a?.['time'] ?? 0) - Number(b?.['time'] ?? 0));
+
     let result: any[] = []
+    let handled: number = 0;
     for (const id in order_list) { // 获取信息 ==================================================================
+        if (handled >= maxOrders) {
+            result.push({"texts": `达到单轮订单数上限 ${maxOrders}，剩余留到下一轮`, "skipped": true});
+            break;
+        }
+        if (Date.now() - startedAt > budgetMs) {
+            result.push({"texts": `达到单轮时间预算 ${budgetMs}ms，剩余留到下一轮`, "skipped": true});
+            break;
+        }
         let order_info = order_list[id]; // 获取当前订单详细情况
         let order_mail = order_info['mail']; // 当前订单用户邮箱
         let order_user: any = (await saves.selectDB( // 查询申请者信息
@@ -185,20 +216,93 @@ export async function Processing(env: Bindings) {
         const locked = await withOrderLock(env, String(order_info['uuid']), async () => {
             if (order_info['flag'] == 0) return await newApply(env, order_user, order_info);// 执行创建订单操作
             if (order_info['flag'] == 1) return await setApply(env, order_user, order_info);// 自动执行域名代理
-            if (order_info['flag'] == 2) return await opDomain(env, order_user, order_info, []);// 自动验证域名
+            // flag=2「待验证」：直接交给 dnsAuthy —— 它内部会对 pending 挑战做本地 dnsCheck，
+            // 未就绪会回到 flag=2，就绪则提交验证。
+            // ⚠️ 原先这里传 `opDomain(..., [])`，而 opDomain 在 sets_list 为空时整段跳过 updateDB，
+            //    等于什么都不做 —— 用户配好 DNS 后订单会永远卡在 flag=2（G13）。
+            if (order_info['flag'] == 2) return await dnsAuthy(env, order_user, order_info, 0);// 自动验证域名
             if (order_info['flag'] == 3) return await dnsAuthy(env, order_user, order_info, 0);// 自动执行域名验证（cron 不等待）
             if (order_info['flag'] == 4) return await getCerts(env, order_user, order_info);// 自动执行获取证书
             return undefined;
         });
+        handled += 1;
         if (!locked.locked) {
             console.log("[Processing] 订单正被处理，本轮跳过:", order_info['uuid']);
             result.push({"uuid": order_info['uuid'], "texts": "订单正在处理中，本轮跳过", "skipped": true});
             continue;
         }
-        // 未知 flag（如 -1）没有对应处理分支，不往结果里塞 undefined
+        // 未知 flag 没有对应处理分支，不往结果里塞 undefined
         if (locked.value !== undefined) result.push(locked.value);
     } // ========================================================================================================
     return result;
+}
+
+// 自动续期 ========================================================================================
+/**
+ * 解析证书链的到期时间（毫秒）。取第一张（叶证书）的 `notAfter`。
+ * 解析失败返回 0，调用方应保守跳过（宁可不续期，也不要基于错的时间乱续）。
+ */
+function certNotAfter(certPem: any): number {
+    if (!certPem) return 0;
+    try {
+        const info: any = (acme.crypto as any).readCertificateInfo(String(certPem));
+        const t: number = new Date(info?.notAfter ?? 0).getTime();
+        return Number.isFinite(t) ? t : 0;
+    } catch (e) {
+        console.error("[renewCerts] 解析证书到期时间失败:", e);
+        return 0;
+    }
+}
+
+/** `auto` 字段的宽松判定（D1 里可能存 1 / "1" / true） */
+function isAutoRenew(auto: any): boolean {
+    if (auto === true) return true;
+    const n = Number(auto);
+    if (Number.isFinite(n)) return n === 1;
+    return String(auto).toLowerCase() === "true";
+}
+
+/**
+ * 自动续期检查（cron 每天一次）。
+ *
+ * 只做一件事：把「已签发（flag=5）且启用自动续期、剩余有效期不足 `CRON_RENEW_DAYS` 天」
+ * 的订单重置为 `flag=0`。**后续的验证与签发完全交给 `Processing()`**，本函数不改动验证逻辑。
+ *
+ * 幂等性：重置后订单不再是 flag=5，下一轮不会被重复捞起。
+ *
+ * ⚠️ 已知缺口（G7，v1 有意保留）：若续期过程中失败（订单落到 flag=-1），本函数不会再捞它，
+ *    需要人工介入或后续版本加退避重试。
+ */
+export async function renewCerts(env: Bindings) {
+    const renewDays: number = Math.max(1, await readInt(env, "CRON_RENEW_DAYS", 30));
+    const threshold: number = Date.now() + renewDays * 24 * 60 * 60 * 1000;
+    const candidates: any[] = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5}});
+
+    let renewed: number = 0;
+    let skipped: number = 0;
+    for (const o of candidates) {
+        if (!isAutoRenew(o?.['auto'])) { skipped++; continue; }        // 未启用自动续期
+        if (!o?.['cert']) { skipped++; continue; }                     // 没有证书可判断
+        const notAfter: number = certNotAfter(o['cert']);
+        if (notAfter <= 0) {
+            console.error("[renewCerts] 无法解析到期时间，跳过:", o?.['uuid']);
+            skipped++;
+            continue;
+        }
+        if (notAfter > threshold) { skipped++; continue; }             // 还没到续期窗口
+        // 置 flag=0 触发全新申请。旧证书仍保留在 cert 字段，续期失败时用户手里还有可用证书。
+        await saves.updateDB(env.DB_CF, "Apply", {
+            flag: 0,
+            text: `自动续期：剩余有效期不足 ${renewDays} 天，已重新提交申请`,
+        }, {uuid: o['uuid']});
+        renewed++;
+        console.log("[renewCerts] 已提交续期:", o['uuid'],
+            "notAfter=" + new Date(notAfter).toISOString());
+    }
+    return {
+        "flag": true,
+        "text": `自动续期检查完成：提交 \`${renewed}\` 个，跳过 \`${skipped}\` 个（阈值 ${renewDays} 天）`
+    };
 }
 
 // 单订单一键推进 ==================================================================================
