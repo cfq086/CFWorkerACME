@@ -52,15 +52,34 @@ export async function dnsUID(env: Bindings, domain_name: string, domain_type: st
     return domain_uuid;
 }
 
+/**
+ * 列出 DCV 区的全部 DNS 记录（**自动分页**）。
+ * ⚠️ Cloudflare 的 `/dns_records` 默认每页只返回 100 条，不分页会漏掉后面的记录
+ *    （记录一多，cleanDNS 就会清不到）。
+ * 返回值保持与原实现兼容：`{success, result: [...], result_info}`。
+ */
 export async function dnsAll(env: Bindings) {
     const [zones, email, token] = await Promise.all([
         dcv(env, "DCV_ZONES"), dcv(env, "DCV_EMAIL"), dcv(env, "DCV_TOKEN"),
     ]);
-    return dnsAPI(
-        "GET", `https://api.cloudflare.com/client/v4/zones/${zones}/dns_records`,
-        {
-            'Authorization': `Bearer ${token}`,
-        }, undefined)
+    const PER_PAGE = 100;
+    const MAX_PAGES = 50; // 兜底：最多 5000 条，避免异常情况下死循环
+    const all: any[] = [];
+    let info: any = null;
+    for (let page = 1; page <= MAX_PAGES; page++) {
+        const resp: any = await dnsAPI(
+            "GET",
+            `https://api.cloudflare.com/client/v4/zones/${zones}/dns_records?page=${page}&per_page=${PER_PAGE}`,
+            {
+                'Authorization': `Bearer ${token}`,
+            }, undefined);
+        const batch: any[] = Array.isArray(resp?.['result']) ? resp['result'] : [];
+        all.push(...batch);
+        info = resp?.['result_info'] ?? info;
+        const total_pages: number = Number(info?.['total_pages'] ?? 0);
+        if (!resp?.['success'] || batch.length === 0 || !total_pages || page >= total_pages) break;
+    }
+    return {success: true, result: all, result_info: info};
 }
 
 export async function uidDel(env: Bindings, domain_uuid: string) {
