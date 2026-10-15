@@ -79,6 +79,9 @@ const DEFAULT_CONFS: Record<string, string> = {
     ORDER_LOCK_MS: "300000",
     // 单轮自动推进最多处理的订单数（防止耗尽子请求配额；免费计划建议 3~4）
     PROCESS_MAX_ORDERS: "10",
+    // 手动路径的"有界短轮询"预算（毫秒）：点"立即处理"后，提交成功最多再等这么久看结果。
+    // cron 路径不使用（提交后立即返回，结果交给下一次触发读取）。
+    MANUAL_WAIT_MS: "60000",
 };
 
 // 模块级标记：避免在同一 Worker 实例中重复迁移。

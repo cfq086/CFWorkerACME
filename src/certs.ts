@@ -7,7 +7,7 @@ import * as query from "./query";
 import {Bindings} from './index'
 import {hmacSHA2} from "./users";
 import {errors} from "wrangler";
-import {readConf} from "./db/conf";
+import {readConf, readInt} from "./db/conf";
 
 
 const acme_url_map: Record<string, any> = {
@@ -119,8 +119,15 @@ export async function Processing(env: Bindings) {
 // - flag=5  证书签发完成
 // - flag=-1 失败
 // - 或中间某步 flag 未发生变化（避免死循环）
-export async function processOne(env: Bindings, order_uuid: string) {
+//
+// 注意：本函数只被**手动入口**调用（`POST /apply/`、`GET /order/?op=process`）。
+// cron 自动推进走 `Processing()`，不经过这里，因此默认带"有界短轮询"预算是安全的。
+//
+// @param wait_ms 透传给 dnsAuthy 的有界等待预算；不传则读 `MANUAL_WAIT_MS`（默认 60000）
+export async function processOne(env: Bindings, order_uuid: string, wait_ms?: number) {
     let result: any[] = [];
+    const manual_wait_ms: number = (wait_ms === undefined)
+        ? await readInt(env, "MANUAL_WAIT_MS", 60000) : wait_ms;
     // 自愈检查：订单已创建（data 存在）但 list 中某些域名 auth 缺失，则强制回到 flag=1 重跑 setApply
     {
         let cur: any = (await saves.selectDB(
@@ -155,7 +162,7 @@ export async function processOne(env: Bindings, order_uuid: string) {
         try {
             if (flag === 0) result.push(await newApply(env, order_user, order_info));
             else if (flag === 1) result.push(await setApply(env, order_user, order_info));
-            else if (flag === 3) result.push(await dnsAuthy(env, order_user, order_info));
+            else if (flag === 3) result.push(await dnsAuthy(env, order_user, order_info, manual_wait_ms));
             else if (flag === 4) result.push(await getCerts(env, order_user, order_info));
             else break; // 其它未知状态，停止推进
         } catch (e) {
@@ -313,29 +320,92 @@ export async function opDomain(env: Bindings, order_user: any, order_info: any, 
     return {"texts": "处理成功"};
 }
 
-// 复核域名在 CA 侧的挑战真实状态 ##################################################################
-// 用途：区分"终态失败"与"仍在验证中"。只做读取，不触发任何状态变更。
-// 挑挑战的优先级与 getAuthy 保持一致（dns-01 优先，其次 http-01）。
-// 返回：挑战 status 字符串；查不到（网络异常/域名不存在）返回 ""。
-async function peekChallengeStatus(client_data: any, orders_text: any, domain_name: string) {
+// 挑战状态探测 / 有界等待 ###########################################################################
+// Step 1 的设计要点：把"同步长轮询"移出请求路径 ——
+//   cron 路径：提交后立即返回，结果交给下一次触发读取；
+//   手动路径：只做**有界**短轮询（默认 ≤60 秒）。
+
+/** 挑战状态探测结果 */
+interface ChallengeProbe {
+    status: string; // pending | processing | valid | invalid | ""（读取失败）
+    reason: string; // CA 的失败原因（invalid / 读取失败时有值）
+}
+
+/** 手动路径的有界轮询间隔 */
+const CHALLENGE_POLL_INTERVAL_MS = 5000;
+/** 提交前"本地可解析性复核"的重试预算（acme-client 默认 10 次退避 ≈3.5 分钟，压到 2 次 ≈1 秒） */
+const VERIFY_CHALLENGE_ATTEMPTS = 2;
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 从挑战对象里取 CA 的失败原因（ACME Problem Details 的 detail）。
+ * 挑战变 invalid 时 CA 会把原因放在 `challenge.error`（RFC 8555 §7.1.6）——
+ * 这也是拆掉 waitForValidStatus 后**保住诊断信息**的关键（原先靠它抛异常的 message 带出来）。
+ */
+function challengeErrorReason(challenge: any): string {
+    const err: any = challenge && challenge['error'];
+    if (!err) return "";
+    if (err['detail']) return String(err['detail']);
     try {
-        let orders_data: any = await client_data.getOrder(orders_text);
-        let author_list: any[] = await client_data.getAuthorizations(orders_data);
-        for (const author_data of author_list) {
-            let author_name: string = author_data['identifier'] ? author_data['identifier']['value'] : "";
-            if (author_data['wildcard'] === true) author_name = "*." + author_name;
-            if (author_name !== domain_name) continue;
-            let challenges: any[] = author_data['challenges'] || [];
-            let picked: any = undefined;
-            for (const c of challenges) if (c.type === "dns-01") { picked = c; break; }
-            if (picked === undefined) for (const c of challenges) if (c.type === "http-01") { picked = c; break; }
-            if (picked) return String(picked['status'] || "");
-            return "";
-        }
-    } catch (e) {
-        console.error('peekChallengeStatus failed:', e);
+        return JSON.stringify(err);
+    } catch {
+        return "";
     }
-    return "";
+}
+
+/**
+ * 单次探测某个挑战的真实状态：对挑战 URL 发一次 POST-as-GET（只读，不触发任何状态变更）。
+ * **不重试**（只消耗 1 个 ACME 请求），失败返回 `status: ""`。
+ * 相比走 `getOrder` + `getAuthorizations` 再找目标挑战，这里少发 N 个请求。
+ */
+async function probeChallenge(client_data: any, challenge: any): Promise<ChallengeProbe> {
+    if (!challenge || !challenge['url']) return {status: "", reason: "挑战对象缺少 url"};
+    try {
+        const resp: any = await client_data.api.apiRequest(challenge['url'], null, [200]);
+        return {
+            status: String(resp?.data?.status || ""),
+            reason: challengeErrorReason(resp?.data),
+        };
+    } catch (e: any) {
+        const reason: string = (e && e.message) ? String(e.message) : extractAcmeError(e);
+        console.error('probeChallenge failed:', reason);
+        return {status: "", reason};
+    }
+}
+
+/**
+ * **有界**等待挑战进入终态：每 `CHALLENGE_POLL_INTERVAL_MS` 探测一次，最多等到 `maxMs`。
+ * 仅手动路径使用；cron 路径不调用本函数（调用方直接跳过）。
+ * 返回最后一次探测结果 —— 若仍是 pending/processing，表示"超时未定终态"，**不算失败**。
+ */
+async function waitForChallenge(client_data: any, challenge: any, maxMs: number): Promise<ChallengeProbe> {
+    const deadline = Date.now() + Math.max(0, maxMs);
+    for (;;) {
+        const probe: ChallengeProbe = await probeChallenge(client_data, challenge);
+        if (probe.status !== "pending" && probe.status !== "processing") return probe; // 已定终态或读取失败
+        if (Date.now() + CHALLENGE_POLL_INTERVAL_MS > deadline) return probe;          // 到点，仍非终态
+        await sleep(CHALLENGE_POLL_INTERVAL_MS);
+    }
+}
+
+/**
+ * 以受限预算执行 `verifyChallenge`。
+ * acme-client 默认 `backoffOpts` 是 `attempts:10 / min:5000 / max:30000`，最坏会在一次同步请求里
+ * 退避 ≈3.5 分钟；而"本地可解析性"外层已经用 `dnsCheck` 查过一次，没必要再等这么久。
+ * 这里临时压缩预算（`finally` 恢复，避免污染同一 Client 实例上的其它调用）。
+ * 压缩后失败会很快抛出，由订单级状态机（flag=2「待验证」）在下一轮重试。
+ */
+async function verifyChallengeBounded(client_data: any, authz: any, challenge: any) {
+    const saved = client_data.backoffOpts;
+    client_data.backoffOpts = {attempts: VERIFY_CHALLENGE_ATTEMPTS, min: 1000, max: 1000};
+    try {
+        return await client_data.verifyChallenge(authz, challenge);
+    } finally {
+        client_data.backoffOpts = saved;
+    }
 }
 
 // 执行域名验证 ====================================================================================
@@ -346,17 +416,25 @@ async function peekChallengeStatus(client_data: any, orders_text: any, domain_na
 //                重复提交是非法操作；且本轮开头的 getAuthy 已取到最新状态，无需再同步轮询
 //                → 保持 flag=3，交由下一次触发 / 定时任务继续推进
 //   pending    → 尚未触发，需要提交。**只有这一步才做本地 DNS 校验**（dnsCheck）：
-//                本地未就绪 → flag=2「待验证」；本地就绪 → verifyChallenge + completeChallenge
-//                + waitForValidStatus
+//                本地未就绪 → flag=2「待验证」；
+//                本地就绪 → verifyChallenge（受限预算）+ completeChallenge + 有界等待
 //   其它/未知  → 保守处理：不推进、不判失败，保持"验证中"
-// 两条核心原则：
+//
+// 三条核心原则：
 //   ① **CA 的真实状态优先于本地 DNS 校验** —— 挑战已是 valid/invalid/processing 时，
 //      本地 TXT 是否还在与判定无关（例如验证通过后清理了 DCV 记录），
 //      绝不能用本地 dnsCheck 的结果把 CA 已完成的订单打回 flag=2。
 //   ② **非终态失败不判死** —— 只有 CA 明确判 invalid 才置 -1；其余失败按
 //      "尚未提交成功 → 2 / 已提交但未定终态 → 3" 分类，避免误杀健康订单。
+//   ③ **长轮询不留在同步请求里（Step 1）** —— 提交成功后不再调用 waitForValidStatus：
+//      cron 路径（wait_ms = 0）立即返回 flag=3，结果交给下一次触发读取；
+//      手动路径（wait_ms > 0）只做有界短轮询，超时未定终态同样保持 flag=3。
+//
 // 订单级 flag 由循环结束后按显式规则汇总（见函数末尾），不再依赖 status_flag 初值隐式推进到 4。
-export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) {
+//
+// @param wait_ms 提交后的有界等待预算（毫秒）。0 = 自动路径（cron），提交后立即返回；
+//                >0 = 手动路径，最多等这么久（由 `MANUAL_WAIT_MS` 配置提供）
+export async function dnsAuthy(env: Bindings, order_user: any, order_info: any, wait_ms: number = 0) {
     let domain_list: any = order_info['list'];
     let orders_text: any = JSON.parse(order_info['data'])
     let client_data: any = await getStart(env, order_user, order_info);
@@ -390,9 +468,13 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
         if (challenge_status == "valid") { // CA 已完成 ================================================
             domain_item.flag = 4;
         } else if (challenge_status == "invalid") { // 终态失败 =========================================
-            console.log('抛错:Challenge Already Invalid:', domain_item.name,
+            // 挑战在 CA 侧已是终态 invalid（RFC 8555 规定不可重试，必须新建订单）。
+            // 原因从 `challenge.error.detail` 取 —— 拆掉 waitForValidStatus 后不再有异常携带它（G1）。
+            const invalid_reason: string = challengeErrorReason(author_data.data);
+            console.log('抛错:Challenge Already Invalid:', domain_item.name, invalid_reason,
                 JSON.stringify(author_data.data));
-            domain_fail.push(domain_item.name + ": 已被 CA 标记为 invalid（不可重试，需重新申请）");
+            domain_fail.push(domain_item.name + ": " +
+                (invalid_reason || "已被 CA 标记为 invalid（不可重试，需重新申请）"));
             domain_item.flag = -1;
             status_fail = true;
         } else if (challenge_status == "processing") { // 已提交，只能"继续等" ==========================
@@ -417,25 +499,46 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
             } else {
                 let submitted: boolean = false; // completeChallenge 是否已成功提交
                 try {
-                    let upload_flag: boolean = await client_data.verifyChallenge(author_data.auth, author_data.data);
+                    // ① 提交前复核本地可解析性（预算已压缩到 ~1 秒，见 verifyChallengeBounded）
+                    let upload_flag: boolean = await verifyChallengeBounded(client_data, author_data.auth, author_data.data);
                     console.log('验证1:Domain Server Verify Status:', upload_flag, JSON.stringify(upload_flag));
+                    // ② 提交触发（RFC 8555：只有 pending 挑战可被触发）
                     let submit_flag = await client_data.completeChallenge(author_data.data);
                     submitted = true;
                     console.log('验证2:Domain Remote Upload Status:', submit_flag['status'], JSON.stringify(submit_flag));
 
-                    let result_flag = await client_data.waitForValidStatus(author_data.data);
-                    console.log('验证3:Domain Remote Verify Status:', result_flag['status'], JSON.stringify(result_flag));
-                    if (result_flag && result_flag.status == "valid") {
+                    // ③ 等待结果 —— **不再同步长轮询**
+                    if (wait_ms > 0) {
+                        // 手动路径：有界短轮询（默认 ≤60 秒）
+                        const probe: ChallengeProbe = await waitForChallenge(client_data, author_data.data, wait_ms);
+                        console.log('验证3:Domain Remote Verify Status:', probe.status, JSON.stringify(probe));
+                        if (probe.status == "valid") {
+                            domain_item.flag = 4;
+                        } else if (probe.status == "invalid") {
+                            // 轮询期间 CA 判了终态失败：与上面的 invalid 分支同义，直接落 -1
+                            console.log('抛错:Challenge Invalid During Wait:', domain_item.name, probe.reason);
+                            domain_fail.push(domain_item.name + ": " +
+                                (probe.reason || "CA 判定验证失败（不可重试，需重新申请）"));
+                            domain_item.flag = -1;
+                            status_fail = true;
+                        } else {
+                            // 超时仍未定终态 / 状态读取失败 → 保持「验证中」，不算失败
+                            domain_wait.push(domain_item.name + ": " +
+                                (probe.status || "状态读取失败") + (probe.reason ? " —— " + probe.reason : ""));
+                        }
+                    } else if (String(submit_flag['status'] || "") == "valid") {
+                        // 自动路径：CA 在提交响应里就给了 valid，直接推进
                         domain_item.flag = 4;
                     } else {
-                        // 拿到返回但不是 valid：按"仍在验证中"处理，不推进
-                        domain_wait.push(domain_item.name + ": " + String(result_flag && result_flag.status));
+                        // 自动路径：提交成功但未定终态 → 立即返回 flag=3，
+                        // 结果由下一次触发（cron / 手动）读取。**这就是 Step 1 的核心。**
+                        domain_wait.push(domain_item.name + ": 已提交，等待 CA 核验");
                     }
                 } catch (error: any) {
                     // 把 CA 返回的真实原因取出来（此前只打了 Error 对象，
                     // Cloudflare 日志只渲染 stack，message 被淹没）。
-                    // waitForValidStatus 抛出的 Error.message 就是 ACME Problem Details 的 detail
-                    // （见 acme-client util.formatResponseError）；其它错误用 extractAcmeError 兜底。
+                    // acme-client 抛出的 Error.message 就是 ACME Problem Details 的 detail
+                    // （见 util.formatResponseError）；其它错误用 extractAcmeError 兜底。
                     const reason: string = (error && error.message)
                         ? String(error.message) : extractAcmeError(error);
                     console.log('抛错1:Domain Remote Verify Reason:', reason);
@@ -445,19 +548,19 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any) 
                     //   ① CA 判 invalid → -1（真失败，必须重新申请）
                     //   ② 尚未提交成功（verifyChallenge / completeChallenge 失败）→ 2「待验证」：
                     //      CA 侧挑战多半仍是 pending，订单并没有死，可以重试
-                    //   ③ 已提交但未定终态（等待超时 / 非 200 / 网络中断）→ 3「验证中」，绝不误杀
-                    const remote_status = await peekChallengeStatus(client_data, orders_text, domain_item.name);
-                    if (remote_status === "invalid") {
-                        domain_fail.push(domain_item.name + ": " + reason);
+                    //   ③ 已提交但未定终态（网络中断 / 非 200 等）→ 3「验证中」，绝不误杀
+                    const probe: ChallengeProbe = await probeChallenge(client_data, author_data.data);
+                    if (probe.status === "invalid") {
+                        domain_fail.push(domain_item.name + ": " + (probe.reason || reason));
                         domain_item.flag = -1;
                         status_fail = true;
                     } else if (!submitted) {
-                        console.log('抛错:Domain Remote Verify 尚未提交成功，回到「待验证」；CA 侧状态:', remote_status || "(未取到)");
+                        console.log('抛错:Domain Remote Verify 尚未提交成功，回到「待验证」；CA 侧状态:', probe.status || "(未取到)");
                         domain_item.flag = 2;
                         status_pending = true;
                         domain_pending.push(domain_item.name + ": " + reason);
                     } else {
-                        console.log('抛错:Domain Remote Verify 已提交但未定终态，保持「验证中」；CA 侧状态:', remote_status || "(未取到)");
+                        console.log('抛错:Domain Remote Verify 已提交但未定终态，保持「验证中」；CA 侧状态:', probe.status || "(未取到)");
                         domain_wait.push(domain_item.name + ": " + reason);
                     }
                 }
