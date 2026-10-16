@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS Apply
     cert TEXT,
     data TEXT,
     text TEXT,
-    lock_until INTEGER NOT NULL DEFAULT (0)
+    lock_until INTEGER NOT NULL DEFAULT (0),
+    last_run INTEGER NOT NULL DEFAULT (0)
 );
 
 -- Apply 索引：Processing（WHERE flag != 5）/ renewCerts（WHERE flag = 5）

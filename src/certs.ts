@@ -12,7 +12,6 @@ import {readConf, readInt} from "./db/conf";
 
 const acme_url_map: Record<string, any> = {
     "lets-encrypt": acme.directory.letsencrypt.production,
-    // "lets-encrypt": "https://encrys.524228.xyz/directory",
     "google-trust": acme.directory.google.production,
     "bypass-trust": acme.directory.buypass.production,
     "zeroca-trust": acme.directory.zerossl.production,
@@ -110,6 +109,14 @@ const ORDER_LOCK_DEFAULT_MS = 300000;
 const PROCESS_BUDGET_MS = 5 * 60 * 1000;
 
 /**
+ * `renewCerts()` 单轮最多处理多少个已签发订单（默认值）。
+ * 已是**兜底防御**：正常路径下 SQL 层就只返回"真的要续期"的几张，远达不到这个上限。
+ * 只有 `next` 大面积写错（导致命中过多）时才会切到这里，按 `time` 升序只处理最老的 N 个，
+ * 剩余下一轮继续（续期窗口 30 天，晚一天无实质影响）。
+ */
+const RENEW_SCAN_LIMIT = 20;
+
+/**
  * 尝试取锁。取锁是**单条原子语句**：
  *
  * ```sql
@@ -136,12 +143,15 @@ async function acquireOrderLock(env: Bindings, uuid: string, leaseMs: number): P
         const changes: number = Number(res?.meta?.changes ?? -1);
         if (changes >= 0) return changes === 1 ? until : 0;
         // 个别运行环境不返回 meta.changes → 读回校验兜底（值等于我们刚写进去的才算抢到）
+        // ⚠️ 这里必须让查询失败**抛错**：静默返回空数组会让兜底误判成"没抢到锁"，
+        //    订单就永远无法被自动推进。抛错由 withOrderLock 的调用方按失败处理。
         console.error("[orderLock] meta.changes 不可用，改用读回校验:", uuid);
     } catch (e) {
         console.error("[orderLock] 取锁失败:", uuid, e);
         return 0;
     }
-    const cur: any = (await saves.selectDB(env.DB_CF, "Apply", {uuid: {value: uuid}}))[0];
+    const cur: any = (await saves.selectDB(
+        env.DB_CF, "Apply", {uuid: {value: uuid}}, {throwOnError: true}))[0];
     return (cur && Number(cur['lock_until']) === until) ? until : 0;
 }
 
@@ -175,6 +185,52 @@ async function withOrderLock<T>(
     }
 }
 
+/**
+ * 订单的"排队键"：**最久没被处理过的排最前**。
+ *
+ * 为什么不能直接按 `time` 排：`time` 是"申请时间"、建单后**永不更新**，
+ * 于是排在前面的订单会反复占用单轮配额（`PROCESS_MAX_ORDERS`），
+ * 后面的订单永远轮不到 —— 这就是**饥饿**。批量续期时尤其明显：
+ * `renewCerts` 一次把 20 张置成 `flag=0`，`Processing` 每轮只处理最老 3 张，
+ * 而这 3 张处理完 `time` 还是最小 → 其余 17 张永远排不上，证书会真的过期。
+ *
+ * `last_run > 0` 用它（上次被处理的时间）；从没处理过（0）回退到 `time`
+ * —— 这样第一轮行为与原先完全一致（最老优先），属于平滑过渡。
+ */
+function orderQueueKey(o: any): number {
+    const last: number = Number(o?.['last_run'] ?? 0);
+    if (last > 0) return last;
+    return Number(o?.['time'] ?? 0);
+}
+
+/**
+ * 标记订单"本轮已被处理过"（必须在**锁内**调用，且放在 `finally` 里）。
+ * 让本单排到队尾，把单轮配额让给别的订单 —— 这是避免饥饿的关键一步。
+ * 失败只记日志：它只是排序提示，写不成功顶多少轮转一次，不该让订单处理失败。
+ */
+async function markOrderRun(env: Bindings, uuid: string): Promise<void> {
+    try {
+        await saves.updateDB(env.DB_CF, "Apply", {last_run: Date.now()}, {uuid});
+    } catch (e) {
+        console.error("[Processing] 更新 last_run 失败:", uuid, e);
+    }
+}
+
+/**
+ * `Processing()` 排队阶段要处理的 flag 集合。
+ * 用 `IN (0,1,2,3,4)` 而不是 `!= 5`：SQLite 的 `!=` 无法用索引定位（仍是全表扫描），
+ * 而 `IN` 能走 `idx_apply_flag_time`。附带好处是 `flag >= 0` 的过滤可以直接省掉。
+ */
+const PROCESSABLE_FLAGS = [0, 1, 2, 3, 4];
+
+/**
+ * `Processing()` 排队阶段**只需要**的列。
+ * 刻意不含 `keys`（私钥）、`cert`（证书链）、`data`（ACME 对象）、`main`、`list`
+ * —— 这些大字段要在锁内对**真正要处理**的那几个订单才取。
+ * 否则一轮就要把全表所有行的私钥/证书都搬进 JS 堆，免费版 10ms CPU 下全是白花的开销。
+ */
+const QUEUE_COLS = ["uuid", "mail", "flag", "time", "last_run"];
+
 // 整体处理进程 ====================================================================================
 // 供 cron（自动推进）与 `/tests/`、`/tasks/` 调用。
 //
@@ -182,24 +238,45 @@ async function withOrderLock<T>(
 // ⚠️ **不要在 `opDomain` 内部再加锁** —— 它的 `dnsAuthy` 调用点只从本函数进入（已在锁内），
 //    重复加锁会因租约未过期而取锁失败，等于把自己锁死。
 //
+// 查询分两段（CPU 优化，见 QUEUE_COLS 注释）：
+//   ① 排队阶段：只查 QUEUE_COLS，用于筛选 + 排序，不碰大字段；
+//   ② 锁内：按 uuid 重查**完整**订单给下游函数用（它们要 order_info.data / list）。
+// 用户查询同理：移到锁内（取不到锁就不查）+ 按 mail 缓存（个人场景一轮只查一次）。
+//
 // 单轮上限（G8）：`scheduled()` 有 15 分钟 duration 上限，而每个订单的处理耗时不可控
 // （还要受子请求配额约束，免费计划只有 50）。所以这里同时限制**订单数**与**总耗时**，
 // 超出的订单留给下一轮。
 export async function Processing(env: Bindings, opts?: { maxOrders?: number; budgetMs?: number }) {
-    const maxOrders: number = opts?.maxOrders ?? await readInt(env, "PROCESS_MAX_ORDERS", 10);
+    const maxOrders: number = opts?.maxOrders ?? await readInt(env, "PROCESS_MAX_ORDERS", 3);
     const budgetMs: number = opts?.budgetMs ?? PROCESS_BUDGET_MS;
     const startedAt: number = Date.now();
 
-    let order_list: any[] = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5, op: "!="}});
-    // 只处理 flag >= 0 的（-1 是终态失败，处理它只会白占预算）；
-    // 按 time 升序 = 最老的订单优先，避免订单多时后面的永远轮不到。
-    order_list = order_list
-        .filter((o: any) => Number(o?.['flag']) >= 0)
-        .sort((a: any, b: any) => Number(a?.['time'] ?? 0) - Number(b?.['time'] ?? 0));
+    // ① 排队阶段：只查最小列集 + 用 IN 走索引（详见 QUEUE_COLS / PROCESSABLE_FLAGS 注释）
+    const queue: any[] = await saves.selectDB(env.DB_CF, "Apply",
+        {flag: {value: PROCESSABLE_FLAGS, op: "IN"}},
+        {cols: QUEUE_COLS});
+    // 按"排队键"升序 = 最久没处理过的优先（见 orderQueueKey：不能直接用 time，
+    // 否则老订单反复占配额 → 后面的饥饿）。
+    // 这里不需要再 filter flag >= 0：IN (0,1,2,3,4) 已经保证了。
+    const order_list: any[] = queue
+        .slice()
+        .sort((a: any, b: any) => orderQueueKey(a) - orderQueueKey(b));
+
+    // ② 一轮内按 mail 缓存用户：个人使用场景下所有订单同一个 mail，
+    //    没必要每个订单都把 Users（含 ACME 私钥）重查一遍。
+    const userCache: Map<string, any> = new Map();
+    const loadUser = async (mail: string): Promise<any> => {
+        const key: string = String(mail ?? "");
+        if (userCache.has(key)) return userCache.get(key);
+        const u: any = (await saves.selectDB(
+            env.DB_CF, "Users", {mail: {value: key}}))[0];
+        userCache.set(key, u ?? null);
+        return u ?? null;
+    };
 
     let result: any[] = []
     let handled: number = 0;
-    for (const id in order_list) { // 获取信息 ==================================================================
+    for (const order_item of order_list) { // 获取信息 ==================================================================
         if (handled >= maxOrders) {
             result.push({"texts": `达到单轮订单数上限 ${maxOrders}，剩余留到下一轮`, "skipped": true});
             break;
@@ -208,27 +285,51 @@ export async function Processing(env: Bindings, opts?: { maxOrders?: number; bud
             result.push({"texts": `达到单轮时间预算 ${budgetMs}ms，剩余留到下一轮`, "skipped": true});
             break;
         }
-        let order_info = order_list[id]; // 获取当前订单详细情况
-        let order_mail = order_info['mail']; // 当前订单用户邮箱
-        let order_user: any = (await saves.selectDB( // 查询申请者信息
-            env.DB_CF, "Users", {mail: {value: order_mail}}))[0]; // 按不同阶段分配程序处理 ========================
+        const order_uuid: string = String(order_item['uuid']);
         // 订单级 CAS 租约锁：取不到说明另一个 invocation（手动点击 / 上一轮 cron）正在处理它
-        const locked = await withOrderLock(env, String(order_info['uuid']), async () => {
-            if (order_info['flag'] == 0) return await newApply(env, order_user, order_info);// 执行创建订单操作
-            if (order_info['flag'] == 1) return await setApply(env, order_user, order_info);// 自动执行域名代理
-            // flag=2「待验证」：直接交给 dnsAuthy —— 它内部会对 pending 挑战做本地 dnsCheck，
-            // 未就绪会回到 flag=2，就绪则提交验证。
-            // ⚠️ 原先这里传 `opDomain(..., [])`，而 opDomain 在 sets_list 为空时整段跳过 updateDB，
-            //    等于什么都不做 —— 用户配好 DNS 后订单会永远卡在 flag=2（G13）。
-            if (order_info['flag'] == 2) return await dnsAuthy(env, order_user, order_info, 0);// 自动验证域名
-            if (order_info['flag'] == 3) return await dnsAuthy(env, order_user, order_info, 0);// 自动执行域名验证（cron 不等待）
-            if (order_info['flag'] == 4) return await getCerts(env, order_user, order_info);// 自动执行获取证书
-            return undefined;
-        });
+        // ⚠️ 整段包 try/catch：单个订单失败（CA 连接失败、订单数据损坏等）**不能中断整轮**，
+        //    否则排在前面的坏订单会让后面的订单永远轮不到（级联故障）。
+        //    withOrderLock 的 finally 保证锁在任何路径下都会释放。
+        let locked: { locked: boolean; value?: any };
+        try {
+            locked = await withOrderLock(env, order_uuid, async () => {
+                // ⚠️ finally 里标记 last_run：**无论成功、失败还是未推进**，都算"本轮处理过了"，
+                //    让本单排到队尾。否则一个反复失败的坏订单会永远占据最老位置，
+                //    把单轮配额吃光 → 别的订单饥饿（与上面 catch 的"级联故障"是两个不同问题）。
+                //    放在锁内还能避免与另一个 invocation 竞争时写乱。
+                try {
+                    // 锁内才取完整订单与用户（取不到锁就完全不查，省掉无用功）。
+                    // flag 也用这里的新值，不用排队阶段的旧快照。
+                    const order_info: any = (await saves.selectDB(
+                        env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
+                    if (!order_info) return undefined; // 订单已被删除
+                    const order_user: any = await loadUser(String(order_info['mail'] ?? ""));
+                    const flag: number = Number(order_info['flag']);
+                    if (flag === 0) return await newApply(env, order_user, order_info);// 执行创建订单操作
+                    if (flag === 1) return await setApply(env, order_user, order_info);// 自动执行域名代理
+                    // flag=2「待验证」/ flag=3「验证中」：直接交给 dnsAuthy。
+                    // ⚠️ 原先 flag=2 走 `opDomain(..., [])`，而它在 sets_list 为空时整段跳过 updateDB，
+                    //    等于什么都不做 —— 用户配好 DNS 后订单会永远卡在 flag=2（G13）。
+                    if (flag === 2 || flag === 3) return await dnsAuthy(env, order_user, order_info, 0);
+                    if (flag === 4) return await getCerts(env, order_user, order_info);// 自动执行获取证书
+                    return undefined;
+                } finally {
+                    await markOrderRun(env, order_uuid);
+                }
+            });
+        } catch (e) {
+            handled += 1;
+            const reason: string = extractAcmeError(e);
+            console.error("[Processing] 订单处理异常，本轮记为失败并继续:", order_uuid, reason);
+            result.push({
+                "uuid": order_uuid, "texts": "处理异常: " + reason, "failed": true
+            });
+            continue;
+        }
         handled += 1;
         if (!locked.locked) {
-            console.log("[Processing] 订单正被处理，本轮跳过:", order_info['uuid']);
-            result.push({"uuid": order_info['uuid'], "texts": "订单正在处理中，本轮跳过", "skipped": true});
+            console.log("[Processing] 订单正被处理，本轮跳过:", order_uuid);
+            result.push({"uuid": order_uuid, "texts": "订单正在处理中，本轮跳过", "skipped": true});
             continue;
         }
         // 未知 flag 没有对应处理分支，不往结果里塞 undefined
@@ -238,22 +339,6 @@ export async function Processing(env: Bindings, opts?: { maxOrders?: number; bud
 }
 
 // 自动续期 ========================================================================================
-/**
- * 解析证书链的到期时间（毫秒）。取第一张（叶证书）的 `notAfter`。
- * 解析失败返回 0，调用方应保守跳过（宁可不续期，也不要基于错的时间乱续）。
- */
-function certNotAfter(certPem: any): number {
-    if (!certPem) return 0;
-    try {
-        const info: any = (acme.crypto as any).readCertificateInfo(String(certPem));
-        const t: number = new Date(info?.notAfter ?? 0).getTime();
-        return Number.isFinite(t) ? t : 0;
-    } catch (e) {
-        console.error("[renewCerts] 解析证书到期时间失败:", e);
-        return 0;
-    }
-}
-
 /** `auto` 字段的宽松判定（D1 里可能存 1 / "1" / true） */
 function isAutoRenew(auto: any): boolean {
     if (auto === true) return true;
@@ -263,12 +348,27 @@ function isAutoRenew(auto: any): boolean {
 }
 
 /**
- * 自动续期检查（cron 每天一次）。
+ * 自动续期检查（cron 每日维护的第一步）。
  *
  * 只做一件事：把「已签发（flag=5）且启用自动续期、剩余有效期不足 `CRON_RENEW_DAYS` 天」
  * 的订单重置为 `flag=0`。**后续的验证与签发完全交给 `Processing()`**，本函数不改动验证逻辑。
  *
  * 幂等性：重置后订单不再是 flag=5，下一轮不会被重复捞起。
+ *
+ * ── 到期日来源（关键设计）───────────────────────────────────────────────
+ * 用 `Apply.next`，**不解析证书**。`next` 由 `getCerts` 在签发成功时写入
+ * （`签发时间 + 90 天`），与证书真实 `notAfter` 只差几小时，而 LE / ZeroSSL / GTS
+ * 的都是 90 天有效期 —— 对 30 天续期窗口没有影响。
+ *
+ * 把过滤推到 SQL 层换来两个决定性好处：
+ *   ① **完全不做 X.509 解析** —— 免费版每次 cron 只有 10ms CPU，而逐个解析证书
+ *      要约 20~60ms（必超；Error 1102 是平台强杀，try/catch 抓不到）；
+ *      现在整轮约 0.2~0.5ms，20 张甚至 100 张证书都安全。
+ *   ② **结果集从「全部已签发订单 + 每张几 KB 的 cert」缩到「真的要续期的那几张」**
+ *      （顺带省掉小 100KB 的 JSON 行→对象转换）。
+ *
+ * 单轮上限（RENEW_SCAN_LIMIT）只是兜底防御：万一 `next` 大面积写错导致命中过多，
+ * 按 `time` 升序只处理最老的 N 个，剩余下一轮（续期窗口 30 天，晚一天无实质影响）。
  *
  * ⚠️ 已知缺口（G7，v1 有意保留）：若续期过程中失败（订单落到 flag=-1），本函数不会再捞它，
  *    需要人工介入或后续版本加退避重试。
@@ -276,32 +376,44 @@ function isAutoRenew(auto: any): boolean {
 export async function renewCerts(env: Bindings) {
     const renewDays: number = Math.max(1, await readInt(env, "CRON_RENEW_DAYS", 30));
     const threshold: number = Date.now() + renewDays * 24 * 60 * 60 * 1000;
-    const candidates: any[] = await saves.selectDB(env.DB_CF, "Apply", {flag: {value: 5}});
+    // SQL 层过滤：flag=5（已签发）且 next <= threshold（已进入续期窗口）。
+    // ⚠️ selectDB 的 where 是对象、同一字段只能出现一次，所以「next > 0」放到下面的 JS 里补。
+    const allDone: any[] = await saves.selectDB(env.DB_CF, "Apply", {
+        flag: {value: 5},
+        next: {value: threshold, op: "<="},
+    });
+    const candidates: any[] = allDone
+        .slice()
+        // 这里可以放心按 time 升序（不需要 orderQueueKey/last_run）：
+        // 候选集是 flag=5，而续期一旦命中就把订单置成 flag=0、**自动退出候选集**，
+        // 所以每轮处理的都是"当前还没续期过的最老几张"，天然轮转、不会饥饿。
+        .sort((a: any, b: any) => Number(a?.['time'] ?? 0) - Number(b?.['time'] ?? 0));
+    const scanLimit: number = await readInt(env, "CRON_RENEW_SCAN", RENEW_SCAN_LIMIT);
+    const scanList: any[] = candidates.slice(0, Math.max(1, scanLimit));
+    const unscanned: number = Math.max(0, candidates.length - scanList.length);
 
     let renewed: number = 0;
     let skipped: number = 0;
-    for (const o of candidates) {
+    for (const o of scanList) {
         if (!isAutoRenew(o?.['auto'])) { skipped++; continue; }        // 未启用自动续期
-        if (!o?.['cert']) { skipped++; continue; }                     // 没有证书可判断
-        const notAfter: number = certNotAfter(o['cert']);
-        if (notAfter <= 0) {
-            console.error("[renewCerts] 无法解析到期时间，跳过:", o?.['uuid']);
-            skipped++;
-            continue;
-        }
-        if (notAfter > threshold) { skipped++; continue; }             // 还没到续期窗口
+        const nextAt: number = Number(o?.['next'] ?? 0);
+        if (nextAt <= 0) { skipped++; continue; }                      // 没有有效到期日（脏数据）
+        if (nextAt > threshold) { skipped++; continue; }               // 双保险：理论上已被 SQL 过滤
         // 置 flag=0 触发全新申请。旧证书仍保留在 cert 字段，续期失败时用户手里还有可用证书。
         await saves.updateDB(env.DB_CF, "Apply", {
             flag: 0,
-            text: `自动续期：剩余有效期不足 ${renewDays} 天，已重新提交申请`,
+            text: `自动续期：到期日 ${new Date(nextAt).toISOString().slice(0, 10)}` +
+                `（不足 ${renewDays} 天），已重新提交申请`,
         }, {uuid: o['uuid']});
         renewed++;
         console.log("[renewCerts] 已提交续期:", o['uuid'],
-            "notAfter=" + new Date(notAfter).toISOString());
+            "next=" + new Date(nextAt).toISOString());
     }
     return {
         "flag": true,
-        "text": `自动续期检查完成：提交 \`${renewed}\` 个，跳过 \`${skipped}\` 个（阈值 ${renewDays} 天）`
+        "text": `自动续期检查完成：提交 \`${renewed}\` 个，跳过 \`${skipped}\` 个` +
+            (unscanned > 0 ? `，未检查 \`${unscanned}\` 个（本轮上限 ${scanLimit}，下一轮继续）` : "") +
+            `（阈值 ${renewDays} 天）`
     };
 }
 

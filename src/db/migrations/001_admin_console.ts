@@ -77,8 +77,19 @@ const DEFAULT_CONFS: Record<string, string> = {
     // 订单处理租约时长（毫秒）。必须大于单次 invocation 的最坏耗时，
     // 否则会出现"上一个 invocation 还在跑、锁已过期被下一个抢走"的情况。
     ORDER_LOCK_MS: "300000",
-    // 单轮自动推进最多处理的订单数（防止耗尽子请求配额；免费计划建议 3~4）
-    PROCESS_MAX_ORDERS: "10",
+    // 单轮自动推进最多处理的订单数。
+    // 取 3 的理由（个人使用 + Workers 免费套餐）：
+    //   ① 子请求配额：免费版每 invocation 只有 50 个，单订单约 12 个 → 3 个订单个约 36，留有余量；
+    //      取 10 会直接超配额定（Error 1027）。
+    //   ② CPU：免费版每 invocation 只有 10ms CPU（平台强杀 Error 1102，try/catch 抓不到），
+    //      单订单约 0.5~2ms，3 个约 1.5~6ms，仍在预算内。
+    PROCESS_MAX_ORDERS: "3",
+    // renewCerts 单轮最多处理多少个已签发订单。
+    // 兜底防御用：正常路径下 SQL 层（flag=5 AND next<=阈值）已只返回"真的要续期"的几张，
+    // 达不到这个上限；只有 next 大面积写错时按 time 升序只处理最老的 N 个。
+    // 注意：续期判断读 Apply.next（getCerts 写入的 签发+90天），**不再解析证书**
+    // —— 免费版每次 cron 只有 10ms CPU，逐个解析证书约 20~60ms 必超。
+    CRON_RENEW_SCAN: "20",
     // 手动路径的"有界短轮询"预算（毫秒）：点"立即处理"后，提交成功最多再等这么久看结果。
     // cron 路径不使用（提交后立即返回，结果交给下一次触发读取）。
     MANUAL_WAIT_MS: "60000",
@@ -192,13 +203,24 @@ async function ensureApplyColumns(dao: Dao): Promise<void> {
             "ALTER TABLE Apply ADD COLUMN lock_until INTEGER NOT NULL DEFAULT 0"
         );
     }
+    // last_run：该订单最后一次被 cron/手动"处理过"的时间（推进排队用）。
+    // 为什么需要它：time 是"申请时间"、建单后永不更新，Processing() 若按 time 升序
+    // 取最老的 N 个，排在前面的订单会反复占用单轮配额，后面的永远轮不到（饥饿）——
+    // 批量续期时 20 张同时置 flag=0，就会卡在最老那 3 张上。
+    // 0 = 从没被处理过（此时用 time 兜底，第一轮行为与原先一致，平滑过渡）。
+    if (!cols.includes("last_run")) {
+        await dao.exec(
+            "ALTER TABLE Apply ADD COLUMN last_run INTEGER NOT NULL DEFAULT 0"
+        );
+    }
 }
 
 /**
  * 给 Apply 建索引（幂等）。
  *
- * 为什么需要：`Processing()` 每次 cron tick 都会 `WHERE flag != 5` 捞全表，
- * `renewCerts()` 每次 `WHERE flag = 5` 捞全表。订单量上來后这两步都是全表扫描，
+ * 为什么需要：`Processing()` 每次 cron tick 都会捞"待处理"订单（现在是
+ * `flag IN (0,1,2,3,4)`，用 IN 是为了能走这个索引），`renewCerts()` 每次
+ * `WHERE flag = 5 AND next <= 阈值`。订单量上來后这些都是全表扫描，
  * 而 D1 单条 SQL 最长 30 秒、单库单线程执行，全表扫描会挤占其它订单的处理时间。
  *
  * 逐个索引单独 try/catch：某个索引创建失败（例如已存在同名但定义不同的索引）

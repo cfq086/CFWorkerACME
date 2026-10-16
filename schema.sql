@@ -35,6 +35,7 @@ CREATE TABLE Apply
     data TEXT, -- 证书临时数据 -- JSON-AL 存储证书申请对象
     text TEXT, -- 证书申请消息 -- 文本格式存储证书消息事件
     lock_until INTEGER NOT NULL DEFAULT (0), -- 订单处理租约：毫秒时间戳，0/过期=可抢占（CAS 锁）
+    last_run INTEGER NOT NULL DEFAULT (0), -- 最后一次被处理的时间：Processing 排队用，避免老订单饥饿（0=从未处理，用 time 兜底）
     -- Flag： 0-待创建 1-处理(平台代理) 2-待确认(用户提交)
     --        3-验证中 4-申请中(验证通过) 5-已成功 -1-失败
     -- Subject内容: { C: '', S: '', ST: '', O: '', E: '' }

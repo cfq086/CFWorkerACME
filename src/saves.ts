@@ -77,14 +77,31 @@ export async function insertDB(
  */
 const CMP_OPS = new Set(["<", "<=", ">", ">="]);
 
+/** 列名白名单：只允许 `[A-Za-z_][A-Za-z0-9_]*`，防止 `opts.cols` 被注入 */
+const COL_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
  * 查询数据（兼容旧签名 `{col: {value, op}}`）。
- * 支持的操作符：`=`（默认）、`!=`、`LIKE`、`NOT LIKE`、`<`、`<=`、`>`、`>=`。
+ * 支持的操作符：`=`（默认）、`!=`、`LIKE`、`NOT LIKE`、`<`、`<=`、`>`、`>=`、`IN`。
  * 每个列只能给一个条件；同一列的多条件请自行用范围/JS 过滤。
+ */
+/**
+ * 查询数据。
+ *
+ * @param opts.throwOnError 查询失败时是否抛错（默认 false，保持旧行为：静默返回空数组）。
+ *        **调用方需要区分"查不到"和"查询失败"时必须传 true** —— 例如订单锁的读回兜底：
+ *        静默返回空数组会让它误判成"没抢到锁"，而抛错则会走向正确的失败路径。
+ * @param opts.cols 只查这些列（默认 `SELECT *`）。
+ *        **读大字段表时强烈建议指定**：例如 `Processing()` 排队阶段只需要
+ *        `uuid/mail/flag/time/last_run`，若 `SELECT *` 会把每行的私钥（keys）、
+ *        证书链（cert）、ACME 对象（data）都搬进 JS 堆 —— 免费版每次 cron 只有
+ *        10ms CPU，这些转换全是白花的开销。
+ *        列名走 `COL_NAME_RE` 白名单，非法列名直接忽略（退回 `SELECT *` 由 D1 报错）。
  */
 export async function selectDB(
     DB: D1Database, table: string,
-    where: SelectWhere
+    where: SelectWhere,
+    opts?: { throwOnError?: boolean; cols?: string[] }
 ): Promise<Record<string, any>[]> {
     const conditions: string[] = [];
     const params: any[] = [];
@@ -99,6 +116,16 @@ export async function selectDB(
         } else if (op === "!=") {
             conditions.push(`${k} != ?`);
             params.push(c.value);
+        } else if (op === "IN") {
+            // IN：值全部走参数绑定，不拼进 SQL；空数组用 "1 = 0" 表示永远不匹配
+            // （SQL 的 `IN ()` 是语法错误，不能直接拼）。
+            const vals: any[] = Array.isArray(c.value) ? c.value : [c.value];
+            if (vals.length === 0) {
+                conditions.push("1 = 0");
+            } else {
+                conditions.push(`${k} IN (${vals.map(() => "?").join(", ")})`);
+                params.push(...vals);
+            }
         } else if (CMP_OPS.has(op)) {
             // 比较运算符：自动续期（next <= now）、订单锁超时判断等场景需要
             conditions.push(`${k} ${op} ?`);
@@ -108,13 +135,18 @@ export async function selectDB(
             params.push(c.value);
         }
     }
-    let sql = `SELECT * FROM ${table} WHERE 1 = 1`;
+    // 只取必要列（默认 *）；列名过白名单，非法的一律丢掉
+    const wanted: string[] = Array.isArray(opts?.cols)
+        ? opts!.cols!.filter((c) => COL_NAME_RE.test(String(c))) : [];
+    const selectSql: string = wanted.length > 0 ? wanted.join(", ") : "*";
+    let sql = `SELECT ${selectSql} FROM ${table} WHERE 1 = 1`;
     if (conditions.length > 0) sql += " AND " + conditions.join(" AND ");
     try {
         const {results} = await (DB as any).prepare(sql).bind(...params).all();
         return results as Record<string, any>[];
     } catch (e) {
         console.error("[saves.selectDB] error:", e);
+        if (opts?.throwOnError) throw e;
         return [];
     }
 }
