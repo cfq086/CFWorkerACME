@@ -57,7 +57,10 @@ CREATE TABLE Apply
     -- }
 );
 
-
+-- Apply 索引：Processing（WHERE flag != 5）/ renewCerts（WHERE flag = 5）
+-- 每次 cron tick 都会全量捞一次，无索引时是全表扫描
+CREATE INDEX IF NOT EXISTS idx_apply_flag_time ON Apply(flag, time);
+CREATE INDEX IF NOT EXISTS idx_apply_mail ON Apply(mail);
 
 -- CREATE TABLE Authy
 -- (

@@ -98,6 +98,7 @@ export async function runMigrations(dao: Dao): Promise<void> {
         await ensureBaseTables(dao);
         await ensureUsersColumns(dao);
         await ensureApplyColumns(dao);
+        await ensureApplyIndexes(dao);
         await seedDefaultConfs(dao);
         _migrated = true;
     } catch (e) {
@@ -190,6 +191,35 @@ async function ensureApplyColumns(dao: Dao): Promise<void> {
         await dao.exec(
             "ALTER TABLE Apply ADD COLUMN lock_until INTEGER NOT NULL DEFAULT 0"
         );
+    }
+}
+
+/**
+ * 给 Apply 建索引（幂等）。
+ *
+ * 为什么需要：`Processing()` 每次 cron tick 都会 `WHERE flag != 5` 捞全表，
+ * `renewCerts()` 每次 `WHERE flag = 5` 捞全表。订单量上來后这两步都是全表扫描，
+ * 而 D1 单条 SQL 最长 30 秒、单库单线程执行，全表扫描会挤占其它订单的处理时间。
+ *
+ * 逐个索引单独 try/catch：某个索引创建失败（例如已存在同名但定义不同的索引）
+ * 不应让后面的步骤被跳过。`CREATE INDEX IF NOT EXISTS` 本身幂等。
+ */
+async function ensureApplyIndexes(dao: Dao): Promise<void> {
+    // (flag, time)：覆盖 Processing / renewCerts 的过滤 + 最老优先排序
+    try {
+        await dao.exec(
+            "CREATE INDEX IF NOT EXISTS idx_apply_flag_time ON Apply(flag, time)"
+        );
+    } catch (e) {
+        console.error("[migrations] create idx_apply_flag_time failed:", e);
+    }
+    // (mail)：按用户查订单列表、删除账号时按 mail 定位
+    try {
+        await dao.exec(
+            "CREATE INDEX IF NOT EXISTS idx_apply_mail ON Apply(mail)"
+        );
+    } catch (e) {
+        console.error("[migrations] create idx_apply_mail failed:", e);
     }
 }
 

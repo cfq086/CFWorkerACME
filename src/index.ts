@@ -328,14 +328,43 @@ app.get('/exits/', async (c: Context): Promise<Response> => {
     return users.userExit(c)
 })
 
+// 运维入口鉴权 ###########################################################################
+// 要求「已登录 + is_admin=1」。用于 /tests/、/tasks/、/clean/：
+//   - /tests/、/tasks/ 会触发**全量**订单推进（Processing），影响所有用户的订单
+//   - /clean/ 会删除 DNS 记录并**把卡死的订单置为失败**，属破坏性操作
+// 返回 null 表示放行；否则直接返回该响应（401 未登录 / 403 非管理员）。
+// 鉴权放在最前面：未授权的请求不应触达任何业务逻辑。
+async function requireAdmin(c: Context): Promise<Response | null> {
+    if (!await users.userAuth(c)) {
+        return c.json({"flags": 2, "texts": "用户尚未登录"}, 401);
+    }
+    const user_email: string | undefined = local.getCookie(c, 'mail');
+    try {
+        const dao = await (await import("./db")).ensureDao(c.env as any);
+        const user = await dao.getUser(user_email ?? "");
+        // 读不到用户或 is_admin 非 1 一律拒绝（不猜默认值）
+        if (!user || Number(user['is_admin'] ?? 0) !== 1) {
+            return c.json({"flags": 3, "texts": "需要管理员权限"}, 403);
+        }
+    } catch {
+        // 校验本身失败时按拒绝处理（宁可挡住管理员，也不放过未授权请求）
+        return c.json({"flags": 3, "texts": "权限校验失败"}, 403);
+    }
+    return null;
+}
+
 // 定时任务 ###############################################################################
 app.get('/tests/', async (c: Context): Promise<Response> => {
+    const denied: Response | null = await requireAdmin(c);
+    if (denied) return denied;
     let result: any[] = await certs.Processing(c.env);
     return c.json(result)
 })
 
 // 定时任务 ###############################################################################
 app.get('/tasks/', async (c: Context): Promise<Response> => {
+    const denied: Response | null = await requireAdmin(c);
+    if (denied) return denied;
     let result: any[] = await certs.Processing(c.env);
     return c.json(result)
 })
@@ -374,6 +403,8 @@ app.use('/token/', async (c: Context): Promise<Response> => {
 
 // 定时任务 ###############################################################################
 app.use('/clean/', async (c: Context): Promise<Response> => {
+    const denied: Response | null = await requireAdmin(c);
+    if (denied) return denied;
     const result: Record<string, any> = await cleanDNS(c.env);
     return c.json({"flag": result.flag, "text": result.text})
 })
