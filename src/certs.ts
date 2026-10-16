@@ -220,8 +220,16 @@ async function markOrderRun(env: Bindings, uuid: string): Promise<void> {
  * `Processing()` 排队阶段要处理的 flag 集合。
  * 用 `IN (0,1,2,3,4)` 而不是 `!= 5`：SQLite 的 `!=` 无法用索引定位（仍是全表扫描），
  * 而 `IN` 能走 `idx_apply_flag_time`。附带好处是 `flag >= 0` 的过滤可以直接省掉。
+ *
+ *    flag=2 的语义是「等 DNS 记录配好」
+ *    **不进自动推进队列**，配好 DNS 后**手动**推进：
+ *      - `GET /order/?op=verify`  → 置 flag=3 并触发一次验证
+ *      - `GET /order/?op=process` → 置 flag=3 后一键推进到底
+ *    （两条路径都在 `index.ts` 的 `/order/` 路由里，不经过本函数。）
+ *    兜底：若始终不处理，`cleanDNS` 会在 DCV 记录超过 `DCV_KEEP_DAYS`（默认 7 天）时
+ *    把这类卡死订单终止，避免产生永久僵尸单。
  */
-const PROCESSABLE_FLAGS = [0, 1, 2, 3, 4];
+const PROCESSABLE_FLAGS = [0, 1, 3, 4];
 
 /**
  * `Processing()` 排队阶段**只需要**的列。
@@ -233,6 +241,10 @@ const QUEUE_COLS = ["uuid", "mail", "flag", "time", "last_run"];
 
 // 整体处理进程 ====================================================================================
 // 供 cron（自动推进）与 `/tests/`、`/tasks/` 调用。
+//
+// ⚠️ 只推进 `PROCESSABLE_FLAGS = [0,1,3,4]`，**刻意跳过 flag=2（待验证）**：
+//    flag=2 要等用户自己配好 DNS 记录后手动推（`/order/?op=verify|process`），
+//    自动去验证没有意义。详见 PROCESSABLE_FLAGS 的注释。
 //
 // ⚠️ 锁是**订单级**粒度：每个订单各自取锁/释放，所以一轮 cron 不会长时间占着一把大锁。
 // ⚠️ **不要在 `opDomain` 内部再加锁** —— 它的 `dnsAuthy` 调用点只从本函数进入（已在锁内），
@@ -257,7 +269,6 @@ export async function Processing(env: Bindings, opts?: { maxOrders?: number; bud
         {cols: QUEUE_COLS});
     // 按"排队键"升序 = 最久没处理过的优先（见 orderQueueKey：不能直接用 time，
     // 否则老订单反复占配额 → 后面的饥饿）。
-    // 这里不需要再 filter flag >= 0：IN (0,1,2,3,4) 已经保证了。
     const order_list: any[] = queue
         .slice()
         .sort((a: any, b: any) => orderQueueKey(a) - orderQueueKey(b));
@@ -307,10 +318,12 @@ export async function Processing(env: Bindings, opts?: { maxOrders?: number; bud
                     const flag: number = Number(order_info['flag']);
                     if (flag === 0) return await newApply(env, order_user, order_info);// 执行创建订单操作
                     if (flag === 1) return await setApply(env, order_user, order_info);// 自动执行域名代理
-                    // flag=2「待验证」/ flag=3「验证中」：直接交给 dnsAuthy。
-                    // ⚠️ 原先 flag=2 走 `opDomain(..., [])`，而它在 sets_list 为空时整段跳过 updateDB，
-                    //    等于什么都不做 —— 用户配好 DNS 后订单会永远卡在 flag=2（G13）。
-                    if (flag === 2 || flag === 3) return await dnsAuthy(env, order_user, order_info, 0);
+                    // flag=3「验证中」：交给 dnsAuthy 继续验证。
+                    // ⚠️ flag=2「待验证」**不在此处理**（它已不在 PROCESSABLE_FLAGS 里）：
+                    //    自动去验证没有意义 —— 用户可能还没配好 DNS 记录，必然失败。
+                    //    等用户配好后自行通过 `/order/?op=verify` 或 `op=process` 手动推进。
+                    //    （原 G13 修复曾让 flag=2 也走 dnsAuthy，2026-10-16 按用户要求回退。）
+                    if (flag === 3) return await dnsAuthy(env, order_user, order_info, 0);
                     if (flag === 4) return await getCerts(env, order_user, order_info);// 自动执行获取证书
                     return undefined;
                 } finally {
