@@ -1,4 +1,5 @@
-import { FileText } from 'lucide-react';
+import { Button } from 'antd';
+import { FileText, RefreshCw } from 'lucide-react';
 import SectionHeader from '@components/Layout/SectionHeader';
 import Pill from '@components/atoms/Pill';
 import CodeInline from '@components/atoms/CodeInline';
@@ -11,9 +12,17 @@ import styles from './Order.module.css';
 
 export interface CertInfoProps {
   order: Order;
+  /** 切换自动续期（仅已签发订单会显示按钮） */
+  onToggleAuto?: (on: boolean) => void;
+  /** 有操作进行中时禁用按钮 */
+  operating?: boolean;
 }
 
-export default function CertInfo({ order }: CertInfoProps) {
+export default function CertInfo({
+  order,
+  onToggleAuto,
+  operating,
+}: CertInfoProps) {
   const subjectParts = [
     order.main.C && `C=${order.main.C}`,
     order.main.S && `S=${order.main.S}`,
@@ -127,12 +136,22 @@ export default function CertInfo({ order }: CertInfoProps) {
         )}
 
         <InfoRow label="自动续期">
-          <Pill
-            variant={order.auto ? 'ok' : 'neutral'}
-            size="sm"
-          >
-            {order.auto ? '已开启' : '未开启'}
-          </Pill>
+          <span className={styles.autoRenewRow}>
+            <Pill variant={order.auto ? 'ok' : 'neutral'} size="sm">
+              {order.auto ? '已开启' : '未开启'}
+            </Pill>
+            {/* 只有已签发（flag=5）的证书才有自动续期的意义，其它状态只展示标识 */}
+            {order.flag === 5 && onToggleAuto && (
+              <Button
+                size="small"
+                icon={<RefreshCw size={12} />}
+                disabled={operating}
+                onClick={() => onToggleAuto(!order.auto)}
+              >
+                {order.auto ? '关闭' : '开启'}
+              </Button>
+            )}
+          </span>
         </InfoRow>
 
         {subjectParts.length > 0 && (

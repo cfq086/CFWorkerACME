@@ -1,5 +1,5 @@
 import {Context, Hono} from 'hono'
-import {opDomain} from "./certs";
+import {opDomain, isAutoRenew} from "./certs";
 import {cleanDNS} from "./query";
 import * as users from './users';
 import * as saves from './saves';
@@ -131,12 +131,15 @@ app.use('/apply/', async (c: Context): Promise<Response> => {
         // 若推进失败（如 ACME 服务端拒绝），把错误原因回显给前端，便于用户即时看到失败原因
         let apply_warn: string | null = null;
         try {
-            await certs.processOne(c.env, uuid);
+            const proc = await certs.processOne(c.env, uuid);
             // 再查一次订单，如果已经被置为失败状态（flag=-1），把 text 作为警告返回
             const fresh: any = await saves.selectDB(
                 c.env.DB_CF, "Apply", {uuid: {value: uuid}});
             if (fresh && fresh[0] && Number(fresh[0].flag) < 0) {
                 apply_warn = String(fresh[0].text || "证书申请处理失败");
+            } else if (!proc.locked) {
+                // 新订单理论上不会被别人锁住；真发生了就如实告知，别假装推进成功
+                apply_warn = "订单正在处理中，请稍后到订单列表刷新";
             }
         } catch (e) {
             const {extractAcmeError} = await import("./certs");
@@ -233,7 +236,33 @@ app.use('/order/', async (c: Context): Promise<Response> => {
                         c.env.DB_CF, "Apply", {uuid: {value: order_uuid}}))[0];
                     await opDomain(c.env, order_user, fresh_info, ["all"]);
                 }
-                await certs.processOne(c.env, order_uuid);
+                const proc = await certs.processOne(c.env, order_uuid);
+                if (!proc.locked) {
+                    // 另一个 invocation（cron / 另一次点击）正在处理该订单
+                    // → 如实告知，而不是静默返回"执行操作成功"让用户以为点了没反应
+                    return c.json({
+                        "flags": 0, "texts": "订单正在处理中，请稍后刷新", "order": order_acts,
+                    });
+                }
+            } else if (order_acts === "auto") { // 切换自动续期（Apply.auto）
+                // 参数：cd=1 开启 / cd=0 关闭；不传则按当前值取反。
+                // 只允许已签发（flag=5）：renewCerts 只处理 flag=5，其它状态设了也没有意义。
+                if (order_data.length === 0)
+                    return c.json({"flags": 6, "texts": "订单不存在"}, 400);
+                const cur_order: any = order_data[0];
+                if (Number(cur_order['flag']) !== 5)
+                    return c.json({"flags": 5, "texts": "只有已签发的证书才能设置自动续期"}, 400);
+                const cur_auto: number = isAutoRenew(cur_order['auto']) ? 1 : 0;
+                const want_auto: number =
+                    (order_push === undefined || order_push === "" || order_push === "undefined")
+                        ? (cur_auto ? 0 : 1)                          // 不传 → 取反
+                        : (order_push === "1" || order_push === "true" ? 1 : 0);
+                await saves.updateDB(c.env.DB_CF, "Apply", {auto: want_auto}, {uuid: order_uuid});
+                return c.json({
+                    "flags": 0,
+                    "texts": want_auto ? "已开启自动续期" : "已关闭自动续期",
+                    "order": order_acts,
+                });
             } else if (order_acts === "reload")
                 await saves.updateDB(c.env.DB_CF, "Apply", {flag: 0}, {uuid: order_uuid})
             else if (order_acts === "modify" || order_acts === "cancel")
@@ -318,14 +347,43 @@ app.get('/exits/', async (c: Context): Promise<Response> => {
     return users.userExit(c)
 })
 
+// 运维入口鉴权 ###########################################################################
+// 要求「已登录 + is_admin=1」。用于 /tests/、/tasks/、/clean/：
+//   - /tests/、/tasks/ 会触发**全量**订单推进（Processing），影响所有用户的订单
+//   - /clean/ 会删除 DNS 记录并**把卡死的订单置为失败**，属破坏性操作
+// 返回 null 表示放行；否则直接返回该响应（401 未登录 / 403 非管理员）。
+// 鉴权放在最前面：未授权的请求不应触达任何业务逻辑。
+async function requireAdmin(c: Context): Promise<Response | null> {
+    if (!await users.userAuth(c)) {
+        return c.json({"flags": 2, "texts": "用户尚未登录"}, 401);
+    }
+    const user_email: string | undefined = local.getCookie(c, 'mail');
+    try {
+        const dao = await (await import("./db")).ensureDao(c.env as any);
+        const user = await dao.getUser(user_email ?? "");
+        // 读不到用户或 is_admin 非 1 一律拒绝（不猜默认值）
+        if (!user || Number(user['is_admin'] ?? 0) !== 1) {
+            return c.json({"flags": 3, "texts": "需要管理员权限"}, 403);
+        }
+    } catch {
+        // 校验本身失败时按拒绝处理（宁可挡住管理员，也不放过未授权请求）
+        return c.json({"flags": 3, "texts": "权限校验失败"}, 403);
+    }
+    return null;
+}
+
 // 定时任务 ###############################################################################
 app.get('/tests/', async (c: Context): Promise<Response> => {
+    const denied: Response | null = await requireAdmin(c);
+    if (denied) return denied;
     let result: any[] = await certs.Processing(c.env);
     return c.json(result)
 })
 
 // 定时任务 ###############################################################################
 app.get('/tasks/', async (c: Context): Promise<Response> => {
+    const denied: Response | null = await requireAdmin(c);
+    if (denied) return denied;
     let result: any[] = await certs.Processing(c.env);
     return c.json(result)
 })
@@ -364,6 +422,8 @@ app.use('/token/', async (c: Context): Promise<Response> => {
 
 // 定时任务 ###############################################################################
 app.use('/clean/', async (c: Context): Promise<Response> => {
+    const denied: Response | null = await requireAdmin(c);
+    if (denied) return denied;
     const result: Record<string, any> = await cleanDNS(c.env);
     return c.json({"flag": result.flag, "text": result.text})
 })

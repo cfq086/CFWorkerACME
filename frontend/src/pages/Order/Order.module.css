@@ -175,6 +175,13 @@
   color: var(--text-1);
 }
 
+/* 「自动续期」行：状态胶囊 + 切换按钮 */
+.autoRenewRow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .domainGroup {
   display: flex;
   flex-wrap: wrap;

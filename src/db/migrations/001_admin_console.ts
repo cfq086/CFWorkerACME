@@ -5,8 +5,9 @@
  *
  * 目标：
  *   1. Users 表补齐 is_admin / quota 字段（若已存在则跳过）。
- *   2. 新建 Confs 表（key-value 配置）。
- *   3. 播种默认配置项（仅在 Confs 中首次不存在时插入）。
+ *   2. Apply 表补齐 lock_until 字段（订单处理租约，若已存在则跳过）。
+ *   3. 新建 Confs 表（key-value 配置）。
+ *   4. 播种默认配置项（仅在 Confs 中首次不存在时插入）。
  *
  * 本脚本通过统一 DAO 适配层执行，避免与 DB_SOURCE 绑定。
  * 每次 Worker 首次请求到达时调用 `runMigrations(dao)` 即可，内部做了单次标记。
@@ -68,6 +69,30 @@ const DEFAULT_CONFS: Record<string, string> = {
     ZRO_keyMC: "",
     ZRO_keyID: "",
     ZRO_KeyTS: "",
+    // 定时任务 / 订单锁 ------------------------------------------------
+    // 自动续期阈值：证书剩余有效期小于该天数即触发续签
+    CRON_RENEW_DAYS: "30",
+    // DCV 记录保留天数，超过即清理（同时终止仍卡在验证的订单）
+    DCV_KEEP_DAYS: "7",
+    // 订单处理租约时长（毫秒）。必须大于单次 invocation 的最坏耗时，
+    // 否则会出现"上一个 invocation 还在跑、锁已过期被下一个抢走"的情况。
+    ORDER_LOCK_MS: "300000",
+    // 单轮自动推进最多处理的订单数。
+    // 取 3 的理由（个人使用 + Workers 免费套餐）：
+    //   ① 子请求配额：免费版每 invocation 只有 50 个，单订单约 12 个 → 3 个订单个约 36，留有余量；
+    //      取 10 会直接超配额定（Error 1027）。
+    //   ② CPU：免费版每 invocation 只有 10ms CPU（平台强杀 Error 1102，try/catch 抓不到），
+    //      单订单约 0.5~2ms，3 个约 1.5~6ms，仍在预算内。
+    PROCESS_MAX_ORDERS: "3",
+    // renewCerts 单轮最多处理多少个已签发订单。
+    // 兜底防御用：正常路径下 SQL 层（flag=5 AND next<=阈值）已只返回"真的要续期"的几张，
+    // 达不到这个上限；只有 next 大面积写错时按 time 升序只处理最老的 N 个。
+    // 注意：续期判断读 Apply.next（getCerts 写入的 签发+90天），**不再解析证书**
+    // —— 免费版每次 cron 只有 10ms CPU，逐个解析证书约 20~60ms 必超。
+    CRON_RENEW_SCAN: "20",
+    // 手动路径的"有界短轮询"预算（毫秒）：点"立即处理"后，提交成功最多再等这么久看结果。
+    // cron 路径不使用（提交后立即返回，结果交给下一次触发读取）。
+    MANUAL_WAIT_MS: "60000",
 };
 
 // 模块级标记：避免在同一 Worker 实例中重复迁移。
@@ -83,6 +108,8 @@ export async function runMigrations(dao: Dao): Promise<void> {
         await ensureConfsTable(dao);
         await ensureBaseTables(dao);
         await ensureUsersColumns(dao);
+        await ensureApplyColumns(dao);
+        await ensureApplyIndexes(dao);
         await seedDefaultConfs(dao);
         _migrated = true;
     } catch (e) {
@@ -135,7 +162,8 @@ async function ensureBaseTables(dao: Dao): Promise<void> {
         "keys TEXT, " +
         "cert TEXT, " +
         "data TEXT, " +
-        "text TEXT)"
+        "text TEXT, " +
+        "lock_until INTEGER NOT NULL DEFAULT 0)"
     );
 }
 
@@ -157,6 +185,63 @@ async function ensureUsersColumns(dao: Dao): Promise<void> {
         await dao.exec(
             "ALTER TABLE Users ADD COLUMN quota INTEGER NOT NULL DEFAULT -1"
         );
+    }
+}
+
+/**
+ * 检查 Apply 表是否已含 lock_until 字段（订单处理租约），缺则 ALTER TABLE 补齐。
+ * 与 ensureUsersColumns 同样先查列名集合再决定是否 ALTER
+ * （SQLite / D1 不支持 `ADD COLUMN IF NOT EXISTS`）。
+ *
+ * lock_until 语义：毫秒时间戳，表示"该订单被某个 invocation 持有的截止时间"。
+ *   0 或小于当前时间 = 空闲可抢；大于当前时间 = 有人正在处理。
+ */
+async function ensureApplyColumns(dao: Dao): Promise<void> {
+    const cols = await dao.columns("Apply");
+    if (!cols.includes("lock_until")) {
+        await dao.exec(
+            "ALTER TABLE Apply ADD COLUMN lock_until INTEGER NOT NULL DEFAULT 0"
+        );
+    }
+    // last_run：该订单最后一次被 cron/手动"处理过"的时间（推进排队用）。
+    // 为什么需要它：time 是"申请时间"、建单后永不更新，Processing() 若按 time 升序
+    // 取最老的 N 个，排在前面的订单会反复占用单轮配额，后面的永远轮不到（饥饿）——
+    // 批量续期时 20 张同时置 flag=0，就会卡在最老那 3 张上。
+    // 0 = 从没被处理过（此时用 time 兜底，第一轮行为与原先一致，平滑过渡）。
+    if (!cols.includes("last_run")) {
+        await dao.exec(
+            "ALTER TABLE Apply ADD COLUMN last_run INTEGER NOT NULL DEFAULT 0"
+        );
+    }
+}
+
+/**
+ * 给 Apply 建索引（幂等）。
+ *
+ * 为什么需要：`Processing()` 每次 cron tick 都会捞"待处理"订单（现在是
+ * `flag IN (0,1,2,3,4)`，用 IN 是为了能走这个索引），`renewCerts()` 每次
+ * `WHERE flag = 5 AND next <= 阈值`。订单量上來后这些都是全表扫描，
+ * 而 D1 单条 SQL 最长 30 秒、单库单线程执行，全表扫描会挤占其它订单的处理时间。
+ *
+ * 逐个索引单独 try/catch：某个索引创建失败（例如已存在同名但定义不同的索引）
+ * 不应让后面的步骤被跳过。`CREATE INDEX IF NOT EXISTS` 本身幂等。
+ */
+async function ensureApplyIndexes(dao: Dao): Promise<void> {
+    // (flag, time)：覆盖 Processing / renewCerts 的过滤 + 最老优先排序
+    try {
+        await dao.exec(
+            "CREATE INDEX IF NOT EXISTS idx_apply_flag_time ON Apply(flag, time)"
+        );
+    } catch (e) {
+        console.error("[migrations] create idx_apply_flag_time failed:", e);
+    }
+    // (mail)：按用户查订单列表、删除账号时按 mail 定位
+    try {
+        await dao.exec(
+            "CREATE INDEX IF NOT EXISTS idx_apply_mail ON Apply(mail)"
+        );
+    } catch (e) {
+        console.error("[migrations] create idx_apply_mail failed:", e);
     }
 }
 

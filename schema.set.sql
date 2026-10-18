@@ -27,8 +27,14 @@ CREATE TABLE IF NOT EXISTS Apply
     keys TEXT,
     cert TEXT,
     data TEXT,
-    text TEXT
+    text TEXT,
+    lock_until INTEGER NOT NULL DEFAULT (0),
+    last_run INTEGER NOT NULL DEFAULT (0)
 );
+
+-- Apply 索引：Processing（WHERE flag != 5）/ renewCerts（WHERE flag = 5）
+CREATE INDEX IF NOT EXISTS idx_apply_flag_time ON Apply(flag, time);
+CREATE INDEX IF NOT EXISTS idx_apply_mail ON Apply(mail);
 
 CREATE TABLE IF NOT EXISTS Confs
 (
