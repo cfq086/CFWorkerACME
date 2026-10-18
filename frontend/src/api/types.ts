@@ -82,7 +82,8 @@ export type OrderAction =
   | 'ca_key'
   | 're_new'
   | 'rm_key'
-  | 'ca_del';
+  | 'ca_del'
+  | 'auto';
 
 /** Nonce 响应 */
 export interface NonceResp {

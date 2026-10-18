@@ -1,5 +1,5 @@
 import {Context, Hono} from 'hono'
-import {opDomain} from "./certs";
+import {opDomain, isAutoRenew} from "./certs";
 import {cleanDNS} from "./query";
 import * as users from './users';
 import * as saves from './saves';
@@ -244,6 +244,25 @@ app.use('/order/', async (c: Context): Promise<Response> => {
                         "flags": 0, "texts": "订单正在处理中，请稍后刷新", "order": order_acts,
                     });
                 }
+            } else if (order_acts === "auto") { // 切换自动续期（Apply.auto）
+                // 参数：cd=1 开启 / cd=0 关闭；不传则按当前值取反。
+                // 只允许已签发（flag=5）：renewCerts 只处理 flag=5，其它状态设了也没有意义。
+                if (order_data.length === 0)
+                    return c.json({"flags": 6, "texts": "订单不存在"}, 400);
+                const cur_order: any = order_data[0];
+                if (Number(cur_order['flag']) !== 5)
+                    return c.json({"flags": 5, "texts": "只有已签发的证书才能设置自动续期"}, 400);
+                const cur_auto: number = isAutoRenew(cur_order['auto']) ? 1 : 0;
+                const want_auto: number =
+                    (order_push === undefined || order_push === "" || order_push === "undefined")
+                        ? (cur_auto ? 0 : 1)                          // 不传 → 取反
+                        : (order_push === "1" || order_push === "true" ? 1 : 0);
+                await saves.updateDB(c.env.DB_CF, "Apply", {auto: want_auto}, {uuid: order_uuid});
+                return c.json({
+                    "flags": 0,
+                    "texts": want_auto ? "已开启自动续期" : "已关闭自动续期",
+                    "order": order_acts,
+                });
             } else if (order_acts === "reload")
                 await saves.updateDB(c.env.DB_CF, "Apply", {flag: 0}, {uuid: order_uuid})
             else if (order_acts === "modify" || order_acts === "cancel")

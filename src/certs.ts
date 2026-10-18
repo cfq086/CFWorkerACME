@@ -352,8 +352,11 @@ export async function Processing(env: Bindings, opts?: { maxOrders?: number; bud
 }
 
 // 自动续期 ========================================================================================
-/** `auto` 字段的宽松判定（D1 里可能存 1 / "1" / true） */
-function isAutoRenew(auto: any): boolean {
+/**
+ * `auto` 字段的宽松判定（D1 里可能存 1 / "1" / true）。
+ * 导出给 `index.ts` 的 `/order/?op=auto` 复用，避免两处各写一份判定。
+ */
+export function isAutoRenew(auto: any): boolean {
     if (auto === true) return true;
     const n = Number(auto);
     if (Number.isFinite(n)) return n === 1;

@@ -62,6 +62,8 @@ export default function OrderPage() {
       requireConfirmId?: string;
       /** 吊销证书时的原因选择（仅 ca_del 有效） */
       pickRevokeReason?: boolean;
+      /** 成功提示文案（不传则统一为「操作成功」） */
+      successMsg?: string;
     },
   ) => {
     if (!uuid) return;
@@ -94,7 +96,7 @@ export default function OrderPage() {
           message.success('操作成功');
           setTimeout(() => navigate('/certs'), 500);
         } else {
-          message.success('操作成功');
+          message.success(opts?.successMsg || '操作成功');
           await load();
         }
       } catch {
@@ -224,7 +226,19 @@ export default function OrderPage() {
       <OrderProgress flag={order.flag} />
 
       {/* 证书信息 */}
-      <CertInfo order={order} />
+      <CertInfo
+        order={order}
+        operating={operating}
+        onToggleAuto={(on) =>
+          handleAction('auto', on ? '1' : '0', {
+            // 开启无需确认；关闭有风险（证书到期不再自动续期），需二次确认
+            confirm: on
+              ? undefined
+              : '关闭后证书到期将不再自动续期，需要手动续期。确认关闭？',
+            successMsg: on ? '已开启自动续期' : '已关闭自动续期',
+          })
+        }
+      />
 
       {/* 域名验证状态（仅在未完成时显示） */}
       {order.flag < 5 && order.flag !== -1 && (
@@ -269,4 +283,5 @@ const ACTION_TIP: Record<string, string> = {
   ca_key: '正在下载密钥...',
   ca_del: '正在吊销证书...',
   rm_key: '正在清理私钥...',
+  auto: '正在更新自动续期设置...',
 };
