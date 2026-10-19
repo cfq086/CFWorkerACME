@@ -6,6 +6,7 @@ import * as agent from "./agent";
 import * as query from "./query";
 import {Bindings} from './index'
 import {hmacSHA2} from "./users";
+import {notifyOrderEvent, FLAG_PENDING} from "./notify";
 import {errors} from "wrangler";
 import {readConf, readInt} from "./db/conf";
 
@@ -497,6 +498,11 @@ async function processOneLocked(
                 console.error("processOne persist error failed:", ue);
             }
             result.push({"texts": "处理失败: " + msg});
+            // 失败通知：newApply 已在自己的 catch 里发过（带 __notified 标记），不重复发
+            if (!(e as any)?.__notified) {
+                await notifyOrderEvent(env,
+                    {...order_info, flag: -1, text: "处理失败: " + msg}, "failed", {reason: msg});
+            }
             break;
         }
         // 若本轮处理后 flag 未推进，防止死循环
@@ -549,16 +555,22 @@ export async function newApply(env: Bindings, order_user: any, order_info: any) 
         const msg = extractAcmeError(e);
         console.error("newApply createOrder failed:", e);
         // 记录到订单：标记失败 + 写入明确错误原因，便于前端显示
+        const failText: string = "订单创建失败: " + msg;
         try {
             await saves.updateDB(env.DB_CF, "Apply",
-                {flag: -1, text: "订单创建失败: " + msg},
+                {flag: -1, text: failText},
                 {uuid: order_info['uuid']});
         } catch (ue) {
             console.error("newApply persist error failed:", ue);
         }
+        // 失败通知（notifyOrderEvent 内部吞错，不会干扰下面的抛错流程）
+        await notifyOrderEvent(env, {...order_info, flag: -1, text: failText},
+            "failed", {reason: msg});
         // 包装后再抛出，调用方（processOne）可直接使用
+        // ⚠️ `__notified`：外层 processOneLocked 的 catch 看到它就**不再重复发信**
         const wrapped: any = new Error(msg);
         wrapped.cause = e;
+        wrapped.__notified = true;
         throw wrapped;
     }
     return {"texts": "处理成功"};
@@ -627,6 +639,13 @@ export async function setApply(env: Bindings, order_user: any, order_info: any) 
     await saves.updateDB(env.DB_CF, "Apply", {list: JSON.stringify(domain_save)}, {uuid: order_info['uuid']})
     await saves.updateDB(env.DB_CF, "Apply", {flag: domain_flag}, {uuid: order_info['uuid']})
     await saves.updateDB(env.DB_CF, "Apply", {text: domain_text}, {uuid: order_info['uuid']})
+    // ⚠️ 这里是 **flag=2「待验证」的真正产生点**（`domain_flag` 初值就是 2）：
+    //    挑战已写入、等用户去配 DNS。发一封「请配置 DNS」提示（bit1 去重，只发一次）。
+    //    注意不是 `dnsAuthy` —— 自动推进下 flag=2 不进队列，那条分支只在手动验证时才会走到。
+    if (domain_flag === 2) {
+        await notifyOrderEvent(env, {...order_info, flag: 2, text: domain_text},
+            "pending", undefined, FLAG_PENDING);
+    }
     // console.log(domain_save);
     return {"texts": domain_text};
 }
@@ -929,12 +948,22 @@ export async function dnsAuthy(env: Bindings, order_user: any, order_info: any, 
     await saves.updateDB(env.DB_CF, "Apply", {data: JSON.stringify(orders_data)}, {uuid: order_info['uuid']})
     await saves.updateDB(env.DB_CF, "Apply", {list: JSON.stringify(domain_save)}, {uuid: order_info['uuid']})
     await saves.updateDB(env.DB_CF, "Apply", {flag: status_flag}, {uuid: order_info['uuid']})
-    if (status_flag == -1) await saves.updateDB(env.DB_CF, "Apply", {
-        text: "域名验证失败:" + JSON.stringify(domain_fail)
-    }, {uuid: order_info['uuid']})
-    else if (status_flag == 2) await saves.updateDB(env.DB_CF, "Apply", {
-        text: "待验证" + (domain_pending.length > 0 ? "：" + JSON.stringify(domain_pending) : "") + "，请处理后重试"
-    }, {uuid: order_info['uuid']})
+    if (status_flag == -1) {
+        const failText: string = "域名验证失败:" + JSON.stringify(domain_fail);
+        await saves.updateDB(env.DB_CF, "Apply", {text: failText}, {uuid: order_info['uuid']})
+        // 终态失败（flag 已置 -1）：发一封失败通知
+        await notifyOrderEvent(env, {...order_info, flag: -1, text: failText},
+            "failed", {reason: failText});
+    }
+    else if (status_flag == 2) {
+        const pendingText: string = "待验证" +
+            (domain_pending.length > 0 ? "：" + JSON.stringify(domain_pending) : "") + "，请处理后重试";
+        await saves.updateDB(env.DB_CF, "Apply", {text: pendingText}, {uuid: order_info['uuid']})
+        // 「请配置 DNS」提示邮件：**只发一次**（notify_flags bit1）。
+        // 否则用户每点一次「验证全部」但 DNS 还没生效，就会重复收到同一封。
+        await notifyOrderEvent(env, {...order_info, flag: 2, text: pendingText},
+            "pending", undefined, FLAG_PENDING);
+    }
     else if (status_flag == 3) await saves.updateDB(env.DB_CF, "Apply", {
         text: "域名验证中：CA 仍在核验" +
             (domain_wait.length > 0 ? " —— " + JSON.stringify(domain_wait) : "") + "，请稍后重试"
@@ -953,6 +982,9 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any) 
     if (orders_data.status == "invalid") {
         await saves.updateDB(env.DB_CF, "Apply", {flag: -1}, {uuid: order_info['uuid']})
         await saves.updateDB(env.DB_CF, "Apply", {text: "证书签发失败"}, {uuid: order_info['uuid']})
+        // 终态失败：通知用户（含 CA 判无效这一原因）
+        await notifyOrderEvent(env, {...order_info, flag: -1, text: "证书签发失败"},
+            "failed", {reason: "证书签发失败：CA 判定该订单无效（invalid）"});
         return {"texts": "验证状态无效"};
     }
     if (orders_data.status === 'ready') {
@@ -982,6 +1014,10 @@ export async function getCerts(env: Bindings, order_user: any, order_info: any) 
         const timestamp = new Date(new Date().setDate(new Date().getDate() + 90)).getTime();
         await saves.updateDB(env.DB_CF, "Apply", {next: timestamp}, {uuid: order_info['uuid']})
         await saves.updateDB(env.DB_CF, "Apply", {text: "恭喜！证书已成功签发"}, {uuid: order_info['uuid']})
+        // 新证书：重置到期提醒去重标记（notify_flags 位掩码），再发签发成功通知
+        await saves.updateDB(env.DB_CF, "Apply", {notify_flags: 0}, {uuid: order_info['uuid']})
+        await notifyOrderEvent(env,
+            {...order_info, flag: 5, next: timestamp, text: "恭喜！证书已成功签发"}, "issued");
         // await saves.updateDB(env.DB, "Apply", {data: ""}, {uuid: order_info['uuid']})
     }
     return {"texts": "处理成功"};
