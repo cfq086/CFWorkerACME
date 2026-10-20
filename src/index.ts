@@ -30,6 +30,9 @@ export type Bindings = {
     // ACME 账号（各 CA 的 EAB） -----------------------------------
     GTS_keyMC: string, GTS_keyID: string, GTS_KeyTS: string, GTS_useIt: string,
     SSL_keyMC: string, SSL_keyID: string, SSL_KeyTS: string, SSL_useIt: string,
+    // Workers Static Assets 绑定（wrangler.jsonc 的 `assets.binding`）——
+    // 静态文件由资产层直接返回；SPA 兜底时用它取 index.html
+    ASSETS: Fetcher,
     ZRO_keyMC: string, ZRO_keyID: string, ZRO_KeyTS: string, ZRO_useIt: string
 }
 export const app = new Hono<{ Bindings: Bindings }>()
