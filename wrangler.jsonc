@@ -11,25 +11,32 @@
   ],
   "vars": {
     "DB_SOURCE": "d1",
+    // 邮件key
     "MAIL_KEYS": "",
-    "MAIL_SEND": "noreply@example.com",
+    "MAIL_SEND": "",
+    // 人机验证
     "AUTH_KEYS": "",
     "SITE_KEYS": "",
+    // CNAME 自动配置的域名，和默认发信email地址
     "DCV_AGENT": "",
     "DCV_EMAIL": "account@example.com",
+    // 需cf托管，需要有dns编辑权限的apikey和域名所在的区域id
     "DCV_TOKEN": "",
     "DCV_ZONES": "",
-    "GTS_useIt": "",
+    // 谷歌证书 key和秘钥
+    "GTS_useIt": "true",
     "GTS_keyMC": "",
     "GTS_keyID": "",
     "GTS_KeyTS": "",
+    // SSL证书 key和秘钥
     "SSL_useIt": "true",
-    "SSL_keyMC": "",
     "SSL_keyID": "",
+    "SSL_keyMC": "",
     "SSL_KeyTS": "",
+    // ZRO证书 key和秘钥
     "ZRO_useIt": "true",
-    "ZRO_keyMC": "",
     "ZRO_keyID": "",
+    "ZRO_keyMC": "",
     "ZRO_KeyTS": ""
   },
   "site": {

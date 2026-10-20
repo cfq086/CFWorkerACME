@@ -343,13 +343,28 @@ export async function codeSend(c: Context, mail: string, code: string) {
 }
 
 // 发送邮件 ###############################################################################
+/**
+ * 发送邮件（HTTP 路径版，保留原签名）—— 注册验证码等场景使用。
+ * 内部只用到 `c.env`，真正发送在 `mailSendRaw`。
+ */
 export async function mailSend(c: Context, email: string, title: string, text: string) {
+    return await mailSendRaw(c.env, email, title, text);
+}
+
+/**
+ * 发送邮件（底层，只需要 env）。
+ * cron / certs 等**没有 Hono Context** 的场景直接用它。
+ *
+ * ⚠️ 这里**不检查 `MAIL_ENABLED`**：该开关只控制「证书事件通知」（见 `src/notify.ts`），
+ *    注册验证码属于功能必需，不能被通知开关关掉，否则用户将无法注册。
+ */
+export async function mailSendRaw(env: any, email: string, title: string, text: string) {
     try {
-        // 统一走 readConf：Confs → env → 默认值 三级回退，无需额外 || c.env.XXX。
+        // 统一走 readConf：Confs → env → 默认值 三级回退，无需额外 || env.XXX。
         const {readConf} = await import("./db/conf");
-        const mailKeys = (await readConf(c.env as any, "MAIL_KEYS")) ?? "";
-        const mailSend = (await readConf(c.env as any, "MAIL_SEND")) ?? "";
-        const siteTitle = (await readConf(c.env as any, "SITE_TITLE")) || "SSL Helper";
+        const mailKeys = (await readConf(env, "MAIL_KEYS")) ?? "";
+        const mailSend = (await readConf(env, "MAIL_SEND")) ?? "";
+        const siteTitle = (await readConf(env, "SITE_TITLE")) || "SSL Helper";
         if (!mailKeys || !mailSend) {
             console.warn("[mailSend] MAIL_KEYS / MAIL_SEND 未配置，已跳过发送", {
                 mailKeysConfigured: !!mailKeys,

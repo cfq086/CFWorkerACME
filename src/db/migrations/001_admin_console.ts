@@ -163,7 +163,9 @@ async function ensureBaseTables(dao: Dao): Promise<void> {
         "cert TEXT, " +
         "data TEXT, " +
         "text TEXT, " +
-        "lock_until INTEGER NOT NULL DEFAULT 0)"
+        "lock_until INTEGER NOT NULL DEFAULT 0, " +
+        "last_run INTEGER NOT NULL DEFAULT 0, " +
+        "notify_flags INTEGER NOT NULL DEFAULT 0)"
     );
 }
 
@@ -211,6 +213,14 @@ async function ensureApplyColumns(dao: Dao): Promise<void> {
     if (!cols.includes("last_run")) {
         await dao.exec(
             "ALTER TABLE Apply ADD COLUMN last_run INTEGER NOT NULL DEFAULT 0"
+        );
+    }
+    // notify_flags：邮件通知去重位掩码（bit0=已发「7 天后到期」）。
+    // 为什么需要：到期提醒在 daily cron 里扫，没有标记就会每天重复发同一封；
+    // getCerts 签发成功时重置为 0（新证书重新计时）。见 src/notify.ts。
+    if (!cols.includes("notify_flags")) {
+        await dao.exec(
+            "ALTER TABLE Apply ADD COLUMN notify_flags INTEGER NOT NULL DEFAULT 0"
         );
     }
 }

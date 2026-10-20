@@ -2,7 +2,20 @@ import {serveStatic} from 'hono/cloudflare-workers' // @ts-ignore
 import manifest from '__STATIC_CONTENT_MANIFEST'
 import * as index from './index'
 import * as certs from './certs'
+import * as notify from './notify'
 import {cleanDNS} from './query'
+import {isScannerProbe} from './utils/probe-guard'
+
+// 扫描器探测拦截 ###############################################################################
+// 必须在静态资源与 SPA 兜底**之前**：否则 `/.env`、`/phpinfo.php` 这类路径会被兜底成
+// 200 + index.html，扫描器据此认为"文件存在"，会一直扫（日志里能看到成片的 .env 探测）。
+// 见 src/utils/probe-guard.ts
+index.app.use("*", async (c, next) => {
+    if (isScannerProbe(new URL(c.req.url).pathname)) {
+        return c.text("Not Found", 404);
+    }
+    await next();
+});
 
 // SPA fallback: 尝试访问请求路径对应的静态文件，失败后回退到 index.html
 index.app.use("*", serveStatic({manifest: manifest, root: "./"}));
@@ -58,13 +71,16 @@ export async function runCronTask(cron: string, env: index.Bindings): Promise<st
         return "push";
     }
     if (key === norm(CRON_DAILY)) {
-        // 每日维护：先续期、再清理。
+        // 每日维护：先续期、再清理、最后发到期提醒。
         // 顺序说明：续期只是把 flag=5 置回 flag=0（不在清理的终止范围内），
         // 而清理只终止仍卡在 flag 1/2/3 的订单 —— 两者互不干扰；
         // 业务上让续期先跑，清理的"终止卡死订单"就看到本轮最新的订单状态。
-        // 两步各自走 runTask（内部 try/catch），任一步失败不影响另一步。
+        // 到期提醒放最后：续期已把 30 天内的订单置 0，这里只剩「关掉自动续期且 7 天内到期」的，
+        // 不会和续期流程重复打扰用户。
+        // 三步各自走 runTask（内部 try/catch），任一步失败不影响另一步。
         await runTask("自动续期", () => certs.renewCerts(env));
         await runTask("DCV 清理", () => cleanDNS(env));
+        await runTask("到期提醒", () => notify.notifyExpiring(env));
         return "daily";
     }
     console.error("[cron] 未识别的 cron 表达式，已忽略:", JSON.stringify(cron),
