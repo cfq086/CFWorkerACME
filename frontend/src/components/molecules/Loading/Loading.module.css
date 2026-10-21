@@ -24,7 +24,7 @@
 
 .kaomoji {
   color: var(--brand);
-  animation: float 2s ease-in-out infinite;
+  animation: none;
 }
 
 .text {
@@ -45,7 +45,7 @@
   height: 6px;
   border-radius: 50%;
   background: var(--brand);
-  animation: loadingDot 1.4s ease-in-out infinite;
+  animation: none;
 }
 
 .dots span:nth-child(1) {

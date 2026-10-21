@@ -6,14 +6,15 @@
   overflow: hidden;
 }
 
-/* ---------- 呼吸光斑 ---------- */
+/* ---------- 呼吸光斑（动画已关闭，仅保留静态柔光） ---------- */
 .blob {
   position: absolute;
   border-radius: 50%;
-  filter: blur(80px);
+  filter: blur(24px);
   opacity: 0.4;
   will-change: transform, opacity;
-  animation: breathe 18s ease-in-out infinite;
+  transform: translateZ(0);
+  animation: none;
 }
 
 .blob1 {

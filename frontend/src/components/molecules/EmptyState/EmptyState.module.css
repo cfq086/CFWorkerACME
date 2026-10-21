@@ -23,7 +23,7 @@
   color: var(--text-3);
   margin-bottom: 4px;
   opacity: 0.85;
-  animation: float 4s ease-in-out infinite;
+  animation: none;
 }
 
 .title {

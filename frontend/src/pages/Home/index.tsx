@@ -22,14 +22,14 @@ import styles from './Home.module.css';
 
 const TYPE_LINES = [
   { prompt: '$ whoami', output: '> guest 🐱', delay: 0 },
-  { prompt: '$ cat welcome.txt', output: '> loading...', delay: 800 },
+  { prompt: '$ cat welcome.txt', output: '> loading...', delay: 200 },
 ];
 
 export default function Home() {
   const [typingDone, setTypingDone] = useState(false);
 
   useEffect(() => {
-    const t = setTimeout(() => setTypingDone(true), 1600);
+    const t = setTimeout(() => setTypingDone(true), 600);
     return () => clearTimeout(t);
   }, []);
 
@@ -41,7 +41,7 @@ export default function Home() {
           className={styles.left}
           initial={{ opacity: 0, x: -20 }}
           animate={{ opacity: 1, x: 0 }}
-          transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+          transition={{ duration: 0.1, ease: [0.22, 1, 0.36, 1] }}
         >
           {/* 终端窗口 */}
           <div className={styles.terminal}>
@@ -59,7 +59,7 @@ export default function Home() {
                   className={styles.terminalLine}
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
-                  transition={{ delay: line.delay / 1000 }}
+                  transition={{ delay: line.delay / 1000, duration: 0.1 }}
                 >
                   <span className={styles.terminalPromptSymbol}>$</span>
                   <span className={styles.terminalCmd}>
@@ -71,7 +71,7 @@ export default function Home() {
                 className={styles.terminalOutput}
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                transition={{ delay: 1.2 }}
+                transition={{ delay: 0.35, duration: 0.1 }}
               >
                 guest ·{' '}
                 <span className={styles.muted}>
@@ -84,7 +84,7 @@ export default function Home() {
                 className={styles.banner}
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: typingDone ? 1 : 0, y: typingDone ? 0 : 8 }}
-                transition={{ duration: 0.5 }}
+                transition={{ duration: 0.1 }}
               >
                 {`╔═══════════════════════════╗
 ║   Free SSL Certificates    ║
@@ -99,7 +99,7 @@ export default function Home() {
             className={styles.subtitle}
             initial={{ opacity: 0, y: 16 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 1.5, duration: 0.5 }}
+            transition={{ delay: 0.45, duration: 0.1 }}
           >
             免费 · 全自动 · 开源的 SSL 证书申请与下发平台
             <br />
@@ -119,7 +119,7 @@ export default function Home() {
             className={styles.ctaGroup}
             initial={{ opacity: 0, y: 16 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 1.8, duration: 0.5 }}
+            transition={{ delay: 0.55, duration: 0.1 }}
           >
             <Link to="/panel" className={`${styles.cta} ${styles.ctaPrimary}`}>
               <LayoutDashboard size={18} />
@@ -160,7 +160,7 @@ export default function Home() {
           className={styles.right}
           initial={{ opacity: 0, x: 20 }}
           animate={{ opacity: 1, x: 0 }}
-          transition={{ delay: 0.3, duration: 0.5 }}
+          transition={{ delay: 0.1, duration: 0.1 }}
         >
           <div className={styles.illustration}>
             <HeroIllustration />
@@ -170,7 +170,7 @@ export default function Home() {
             className={styles.features}
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 2.1, duration: 0.5 }}
+            transition={{ delay: 0.65, duration: 0.1 }}
           >
             <FeatureItem
               icon={<Shield size={18} />}
@@ -205,7 +205,7 @@ export default function Home() {
         className={styles.footer}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
-        transition={{ delay: 2.4 }}
+        transition={{ delay: 0.75, duration: 0.1 }}
       >
         <div className={styles.footerLeft}>
           <Pill variant="neutral" size="xs">

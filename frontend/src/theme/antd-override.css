@@ -341,7 +341,7 @@
     var(--bg-code) 75%
   ) !important;
   background-size: 200% 100% !important;
-  animation: shimmer 1.5s ease-in-out infinite !important;
+  animation: none !important;
   border-radius: var(--radius-md) !important;
 }
 

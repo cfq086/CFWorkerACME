@@ -1,5 +1,4 @@
 import type { ReactNode } from 'react';
-import { motion } from 'framer-motion';
 import styles from './PageShell.module.css';
 
 export interface PageShellProps {
@@ -10,7 +9,8 @@ export interface PageShellProps {
 }
 
 /**
- * 页面外壳 —— 统一管理入场动画与内容边距
+ * 页面外壳 —— 统一管理内容边距
+ * 注：入场动画已移除（路由切换不做淡入淡出，保持瞬时切换）
  */
 export default function PageShell({
   children,
@@ -19,7 +19,7 @@ export default function PageShell({
   padded = true,
 }: PageShellProps) {
   return (
-    <motion.div
+    <div
       className={[styles.shell, padded && styles.padded, className]
         .filter(Boolean)
         .join(' ')}
@@ -27,12 +27,8 @@ export default function PageShell({
         maxWidth:
           typeof maxWidth === 'number' ? `${maxWidth}px` : maxWidth,
       }}
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -12 }}
-      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
     >
       {children}
-    </motion.div>
+    </div>
   );
 }
