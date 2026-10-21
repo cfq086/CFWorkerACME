@@ -24,10 +24,12 @@ index.app.use("*", async (c, next) => {
 // ⚠️ 必须在 probe-guard 中间件**之后**注册：Hono 按注册顺序执行，
 //    否则敏感路径会被这里兜底成 200。
 // ⚠️ 不要给入口 HTML 加长缓存：否则发版后用户会一直拿旧的 index.html。
+// ⚠️ 也**不要**在这里改响应头：`env.ASSETS.fetch()` 返回的是网络响应，其 headers guard 是
+//    **immutable**，`res.headers.set(...)` 会抛 TypeError；catch-all 里没人接 →
+//    所有未命中静态的 GET（/certs、/order/xxx、/favicon.svg）全部 500（2026-10-21 踩过）。
+//    assets 层自带 `Cache-Control: public, max-age=0, must-revalidate` + ETag，入口 HTML 够用。
 index.app.get("*", async (c) => {
-    const res = await c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
-    res.headers.set("Cache-Control", "no-cache");
-    return res;
+    return await c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
 });
 // export default index.app
 index.app.fire()

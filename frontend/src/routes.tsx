@@ -6,29 +6,24 @@ import { useAuthStore } from '@stores/useAuthStore';
 import { useBootstrapStore } from '@stores/useBootstrapStore';
 import Loading from '@components/molecules/Loading';
 
-// 布局与侧边栏页面全部同步引入：
-// 之前用 lazy() 懒加载，首次点击侧边栏时浏览器现场下载 JS chunk，
-// Suspense 会闪现全屏 Loading（"闪一下"）。同步引入后这些页面已在主包里，
-// 切换永远零等待。只有首屏的 Home/Login/Setup 保留懒加载，控制首包体积。
-import PublicLayout from '@layouts/PublicLayout';
-import AdminLayout from '@layouts/AdminLayout';
-import ProtectedRoute from '@components/Layout/ProtectedRoute';
-import Panel from '@pages/Panel';
-import Certs from '@pages/Certs';
-import Apply from '@pages/Apply';
-import Order from '@pages/Order';
-import Account from '@pages/Account';
-import ApiDoc from '@pages/Account/ApiDoc';
-import Help from '@pages/Help';
-import About from '@pages/About';
-import AdminUsers from '@pages/Admin/Users';
-import AdminCerts from '@pages/Admin/Certs';
-import AdminSystem from '@pages/Admin/System';
-
-// 首屏懒加载（进入时正常加载一次，不涉及侧边栏切换闪屏）
+// 路由懒加载
+const PublicLayout = lazy(() => import('@layouts/PublicLayout'));
+const AdminLayout = lazy(() => import('@layouts/AdminLayout'));
 const Home = lazy(() => import('@pages/Home'));
 const Login = lazy(() => import('@pages/Login'));
+const Panel = lazy(() => import('@pages/Panel'));
+const Certs = lazy(() => import('@pages/Certs'));
+const Apply = lazy(() => import('@pages/Apply'));
+const Order = lazy(() => import('@pages/Order'));
+const Account = lazy(() => import('@pages/Account'));
+const ApiDoc = lazy(() => import('@pages/Account/ApiDoc'));
+const Help = lazy(() => import('@pages/Help'));
+const About = lazy(() => import('@pages/About'));
 const Setup = lazy(() => import('@pages/Setup'));
+const AdminUsers = lazy(() => import('@pages/Admin/Users'));
+const AdminCerts = lazy(() => import('@pages/Admin/Certs'));
+const AdminSystem = lazy(() => import('@pages/Admin/System'));
+const ProtectedRoute = lazy(() => import('@components/Layout/ProtectedRoute'));
 
 function AppRoutes() {
   const location = useLocation();
@@ -77,7 +72,7 @@ function AppRoutes() {
 
   return (
     <Suspense fallback={<Loading full />}>
-      <Routes location={location} key={location.pathname}>
+        <Routes location={location} key={location.pathname}>
           {/* Setup 页面：initialized 后自行跳登录 */}
           <Route path="/setup" element={<Setup />} />
 
