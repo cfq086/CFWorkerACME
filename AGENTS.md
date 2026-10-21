@@ -43,3 +43,4 @@ CertHub (CFWorkerACME): a self-hosted ACME SSL certificate issuance platform (Ho
 - Code comments, logs, and commit messages are in **Chinese** — keep new code consistent.
 - Frontend uses React + antd with a Cyber-Kawaii terminal theme, **HashRouter** (routes like `/#/admin/...` so they never collide with real backend `/admin` paths). Path aliases `@/`, `@components/`, `@pages/`, `@api/` etc. are defined in `frontend/vite.config.ts`.
 - Docker injects env with an `OPLIST_` prefix, stripped and sed-rewritten into `wrangler.jsonc` by `entrypoint.sh`.
+- **`npm install` 造成的 `package-lock.json` / `frontend/package-lock.json` 自动规范化改动禁止提交**（本机 npm 版本不同会让 lockfile 重写：删 `dev: true` 标记、增删平台二进制条目等）。这属于安装副作用，与功能无关；提交前需将其恢复原状（`git checkout main -- package-lock.json frontend/package-lock.json`）后再提交。
