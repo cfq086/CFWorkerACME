@@ -390,12 +390,10 @@ export default function Login() {
 /* ---------- 装饰插画 ---------- */
 function LoginIllustration() {
   return (
-    <motion.svg
+    <svg
       viewBox="0 0 400 300"
       xmlns="http://www.w3.org/2000/svg"
       className={styles.illustration}
-      animate={{ y: [0, -6, 0] }}
-      transition={{ duration: 5, repeat: Infinity, ease: 'easeInOut' }}
       aria-hidden="true"
     >
       <defs>
@@ -437,6 +435,6 @@ function LoginIllustration() {
       <circle cx="340" cy="70" r="5" fill="var(--sakura)" opacity="0.7" />
       <circle cx="60" cy="240" r="3" fill="var(--lavender)" opacity="0.6" />
       <circle cx="350" cy="250" r="4" fill="var(--brand)" opacity="0.7" />
-    </motion.svg>
+    </svg>
   );
 }

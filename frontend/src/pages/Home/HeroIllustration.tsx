@@ -1,19 +1,16 @@
-import { motion } from 'framer-motion';
-
 /**
  * 首页插画 —— 原创 SVG：圆润锁 + 云朵 + 小星星 + 光斑
+ * 注：循环动画已全部移除（framer-motion 无限动画会持续占用合成线程导致卡顿），保留静态效果。
  */
 export default function HeroIllustration() {
   return (
-    <motion.svg
+    <svg
       width="100%"
       height="100%"
       viewBox="0 0 480 480"
       xmlns="http://www.w3.org/2000/svg"
       style={{ maxWidth: 480 }}
       aria-label="CertHub illustration"
-      animate={{ y: [0, -8, 0] }}
-      transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
     >
       <defs>
         <linearGradient id="bgGlow" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -44,29 +41,18 @@ export default function HeroIllustration() {
       <circle cx="240" cy="240" r="160" fill="none" stroke="var(--brand-soft)" strokeWidth="1" strokeDasharray="4 8" opacity="0.5" />
 
       {/* 云朵（装饰） */}
-      <motion.g
-        animate={{ x: [0, 12, 0] }}
-        transition={{ duration: 8, repeat: Infinity, ease: 'easeInOut' }}
-      >
+      <g>
         <ellipse cx="100" cy="120" rx="42" ry="22" fill="url(#cloudGrad)" stroke="var(--line)" strokeWidth="1.5" />
         <ellipse cx="130" cy="110" rx="30" ry="18" fill="url(#cloudGrad)" stroke="var(--line)" strokeWidth="1.5" />
-      </motion.g>
+      </g>
 
-      <motion.g
-        animate={{ x: [0, -10, 0] }}
-        transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut' }}
-      >
+      <g>
         <ellipse cx="380" cy="350" rx="36" ry="18" fill="url(#cloudGrad)" stroke="var(--line)" strokeWidth="1.5" />
         <ellipse cx="355" cy="342" rx="22" ry="14" fill="url(#cloudGrad)" stroke="var(--line)" strokeWidth="1.5" />
-      </motion.g>
+      </g>
 
       {/* 中央锁 */}
-      <motion.g
-        filter="url(#softShadow)"
-        animate={{ scale: [1, 1.03, 1] }}
-        transition={{ duration: 3.5, repeat: Infinity, ease: 'easeInOut' }}
-        style={{ transformOrigin: '240px 240px' }}
-      >
+      <g filter="url(#softShadow)">
         {/* 锁主体 */}
         <rect
           x="160"
@@ -98,14 +84,10 @@ export default function HeroIllustration() {
           fill="none"
           opacity="0.6"
         />
-      </motion.g>
+      </g>
 
-      {/* 小星星（旋转装饰） */}
-      <motion.g
-        animate={{ rotate: 360 }}
-        transition={{ duration: 20, repeat: Infinity, ease: 'linear' }}
-        style={{ transformOrigin: '240px 240px' }}
-      >
+      {/* 小星星（静态装饰） */}
+      <g>
         <path
           d="M 100 280 L 104 288 L 112 290 L 104 292 L 100 300 L 96 292 L 88 290 L 96 288 Z"
           fill="var(--accent)"
@@ -118,19 +100,15 @@ export default function HeroIllustration() {
           d="M 350 100 L 353 107 L 360 108 L 353 109 L 350 116 L 347 109 L 340 108 L 347 107 Z"
           fill="var(--sakura)"
         />
-      </motion.g>
+      </g>
 
-      {/* 环绕小圆点 */}
-      <motion.g
-        animate={{ rotate: -360 }}
-        transition={{ duration: 30, repeat: Infinity, ease: 'linear' }}
-        style={{ transformOrigin: '240px 240px' }}
-      >
+      {/* 环绕小圆点（静态装饰） */}
+      <g>
         <circle cx="240" cy="60" r="4" fill="var(--brand)" opacity="0.6" />
         <circle cx="420" cy="240" r="4" fill="var(--accent)" opacity="0.6" />
         <circle cx="240" cy="420" r="4" fill="var(--lavender)" opacity="0.6" />
         <circle cx="60" cy="240" r="4" fill="var(--sakura)" opacity="0.6" />
-      </motion.g>
-    </motion.svg>
+      </g>
+    </svg>
   );
 }

@@ -105,7 +105,7 @@
 .progressBlockCurrent {
   background: var(--gradient-brand) !important;
   box-shadow: 0 2px 8px var(--brand-glow);
-  animation: progressPulse 2s ease-in-out infinite;
+  animation: none;
 }
 
 .progressBlockCurrent .progressBlockLabel {

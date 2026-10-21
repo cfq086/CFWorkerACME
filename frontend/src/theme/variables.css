@@ -78,9 +78,9 @@
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-in: cubic-bezier(0.65, 0, 0.35, 1);
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-  --duration-fast: 0.15s;
-  --duration-base: 0.25s;
-  --duration-slow: 0.4s;
+  --duration-fast: 0.06s;
+  --duration-base: 0.1s;
+  --duration-slow: 0.15s;
 
   /* ---------- 断点（给 JS 读取） ---------- */
   --bp-xs: 480px;

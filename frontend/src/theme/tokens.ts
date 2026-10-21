@@ -31,9 +31,9 @@ const baseToken = {
 
   // 其他
   wireframe: false,
-  motionDurationFast: '0.15s',
-  motionDurationMid: '0.25s',
-  motionDurationSlow: '0.4s',
+  motionDurationFast: '0.06s',
+  motionDurationMid: '0.1s',
+  motionDurationSlow: '0.15s',
   motionEaseOut: 'cubic-bezier(0.22, 1, 0.36, 1)',
   motionEaseInOut: 'cubic-bezier(0.65, 0, 0.35, 1)',
 };

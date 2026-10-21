@@ -50,7 +50,7 @@
 .cursor {
   display: inline-block;
   color: var(--brand);
-  animation: blink 1s steps(1) infinite;
+  animation: none;
   line-height: 1;
   font-size: 0.9em;
 }

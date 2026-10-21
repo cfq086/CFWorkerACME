@@ -280,31 +280,31 @@
 }
 
 .anim-pulse {
-  animation: pulse 2s ease-in-out infinite;
+  animation: none;
 }
 
 .anim-blink {
-  animation: blink 1s steps(1) infinite;
+  animation: none;
 }
 
 .anim-breathe {
-  animation: breathe 15s ease-in-out infinite;
+  animation: none;
 }
 
 .anim-float {
-  animation: float 4s ease-in-out infinite;
+  animation: none;
 }
 
 .anim-spin {
-  animation: spin 1s linear infinite;
+  animation: none;
 }
 
 .anim-wiggle {
-  animation: wiggle 0.5s ease-in-out;
+  animation: none;
 }
 
 .anim-glow {
-  animation: glow 3s ease-in-out infinite;
+  animation: none;
 }
 
 /* 延迟类（交错动画） */
