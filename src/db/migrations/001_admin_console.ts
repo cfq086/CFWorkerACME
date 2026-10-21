@@ -99,11 +99,37 @@ const DEFAULT_CONFS: Record<string, string> = {
 let _migrated = false;
 
 /**
+ * 迁移版本标记（写在 Confs 表里）。
+ * ⚠️ **每次新增/修改迁移逻辑时都要更新这个值**，否则已有标记的实例会跳过新迁移。
+ */
+const SCHEMA_VERSION = "2026-10-21";
+const SCHEMA_VERSION_KEY = "_schema_version";
+
+/**
  * 执行一次迁移（幂等）。
+ *
+ * ⚠️ 关键优化（2026-10-21）：先查一个**持久化**的版本标记，已是最新就整段跳过。
+ * 原来只有模块级的 `_migrated`，Worker 冷启动后归零 → 每次冷启动都要跑 20+ 个 D1 查询
+ * （建表 ×5 / PRAGMA ×2 / 索引 ×3 / 播种 8 个默认配置），跨太平洋每个 ~500ms，
+ * 实测首屏 `/bootstrap` 的 TTFB 高达 **12.24 秒**。
+ * 加标记后冷启动只查 1 次，降到 ~0.5 秒。
+ *
  * @param dao 当前请求上下文使用的 DAO 实例。
  */
 export async function runMigrations(dao: Dao): Promise<void> {
     if (_migrated) return;
+
+    // 快速路径：查持久化标记（1 个查询）。表还不存在时会抛错 → 落到下面的完整迁移。
+    try {
+        const ready = await dao.getConf(SCHEMA_VERSION_KEY);
+        if (ready === SCHEMA_VERSION) {
+            _migrated = true;
+            return;
+        }
+    } catch {
+        /* Confs 表不存在（全新库）→ 走完整迁移 */
+    }
+
     try {
         await ensureConfsTable(dao);
         await ensureBaseTables(dao);
@@ -111,6 +137,8 @@ export async function runMigrations(dao: Dao): Promise<void> {
         await ensureApplyColumns(dao);
         await ensureApplyIndexes(dao);
         await seedDefaultConfs(dao);
+        // 标记放在**最后**：中途失败则不写，下次还会重试（保持幂等与可恢复）
+        await dao.upsertConf(SCHEMA_VERSION_KEY, SCHEMA_VERSION, Date.now());
         _migrated = true;
     } catch (e) {
         // 迁移失败不应阻断所有请求；记录日志后由上层降级处理。

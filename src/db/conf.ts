@@ -124,3 +124,53 @@ export async function readConfMap(
     for (const n of names) result[n] = await readConf(env, n);
     return result;
 }
+
+/**
+ * **批量读配置（1 个 D1 查询）** —— 区别于上面的 `readConfMap`（它其实是逐个 await）。
+ *
+ * 为什么需要：`/bootstrap` 一次要读十几个键，逐个 `readConf` 就是十几个串行 D1 查询，
+ * 跨太平洋每个 ~500ms → 实测 5~6 秒。这里用 `dao.listConfs()` 一次拉全表（几十行）
+ * 填进缓存，同样十几个键只要 **1 个查询**。
+ *
+ * 回退顺序与 `readConf` 保持一致：缓存 → Confs → env → 默认值。
+ */
+export async function readConfsBulk(
+    env: DbEnv & Record<string, any>,
+    names: string[]
+): Promise<Record<string, string | null>> {
+    const out: Record<string, string | null> = {};
+    const now = Date.now();
+    const miss: string[] = [];
+    for (const n of names) {
+        const c = _cache.get(n);
+        if (c && c.expireAt > now) out[n] = c.value;
+        else miss.push(n);
+    }
+    if (miss.length === 0) return out;
+
+    try {
+        const dao = await ensureDao(env);
+        const rows = await dao.listConfs();          // ← 1 个查询拿全部配置
+        const map: Record<string, string | null> = {};
+        for (const r of rows) map[r.name] = r.data ?? null;
+        for (const n of miss) {
+            const v: string | null = map[n] ?? null;
+            out[n] = v;
+            _cache.set(n, {value: v, expireAt: now + CACHE_TTL_MS});
+        }
+    } catch {
+        // DB 不可用 → 与 readConf 相同的回退：env → 默认值
+        for (const n of miss) {
+            let v: string | null = null;
+            const fromEnv = env?.[n];
+            if (typeof fromEnv === "string" && fromEnv.length > 0) v = fromEnv;
+            if (v === null) {
+                const def = DEFAULT_CONF_MAP[n];
+                if (def !== undefined) v = def;
+            }
+            out[n] = v;
+            _cache.set(n, {value: v, expireAt: now + CACHE_TTL_MS});
+        }
+    }
+    return out;
+}

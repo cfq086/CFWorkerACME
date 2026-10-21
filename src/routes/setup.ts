@@ -11,7 +11,7 @@
 import type {Context, Hono} from "hono";
 import type {Bindings} from "../index";
 import {ensureDao, normalizeDbSource, rawDao} from "../db";
-import {readBool, readConf, writeConf, invalidateConf} from "../db/conf";
+import {readBool, readConf, writeConf, invalidateConf, readConfsBulk, asBool} from "../db/conf";
 import CryptoJS from "crypto-js";
 // @ts-ignore - nodejs_compat 下 Cloudflare Workers 提供 crypto 模块
 import {generateKeyPairSync} from "crypto";
@@ -95,26 +95,27 @@ export async function handleBootstrap(c: Context<{ Bindings: Bindings }>): Promi
     }
 
     // 2) 读取初始化标记和相关配置 --------------------------------------------
-    // 注意：DB 不可用时，下列 read 调用会回退到 env/默认值。
-    try {
-        initialized = await readBool(env, "INITIALIZED", false);
-    } catch {
-        initialized = false;
-    }
+    // ⚠️ 必须**批量读**：原来逐个 readConf 是 12 个串行 D1 查询，跨太平洋每个 ~500ms
+    //    → /bootstrap 实测 TTFB 5~6 秒。改成 readConfsBulk（内部一次 listConfs）
+    //    后只要 1 个查询，降到 ~0.5 秒。DB 不可用时内部会回退 env / 默认值。
+    const conf = await readConfsBulk(env, [
+        "INITIALIZED", "SITE_TITLE", "SITE_HOST", "MAIL_ENABLED",
+        "REGISTER_ALLOW", "REGISTER_CODE",
+        "CERT_CAPTCHA_ENABLED", "BASE_CAPTCHA_ENABLED", "CERT_CAPTCHA_PROVIDER",
+        "SITE_KEYS", "CERT_CAPTCHA_SITE_KEY",
+    ]);
+    initialized = asBool(conf["INITIALIZED"], false);
 
-    const siteTitle = (await safeRead(env, "SITE_TITLE")) ?? "SSL 证书助手";
-    const siteHost = (await safeRead(env, "SITE_HOST")) ?? "";
-    const mailEnabled = await safeReadBool(env, "MAIL_ENABLED", false);
-    const registerAllow = await safeReadBool(env, "REGISTER_ALLOW", true);
-    const registerCode = (await safeRead(env, "REGISTER_CODE")) ?? "";
-    const captchaEnabled = await safeReadBool(env, "CERT_CAPTCHA_ENABLED", false);
-    const baseCaptchaEnabled = await safeReadBool(env, "BASE_CAPTCHA_ENABLED", false);
-    const captchaProvider = (await safeRead(env, "CERT_CAPTCHA_PROVIDER")) ?? "turnstile";
+    const siteTitle = conf["SITE_TITLE"] ?? "SSL 证书助手";
+    const siteHost = conf["SITE_HOST"] ?? "";
+    const mailEnabled = asBool(conf["MAIL_ENABLED"], false);
+    const registerAllow = asBool(conf["REGISTER_ALLOW"], true);
+    const registerCode = conf["REGISTER_CODE"] ?? "";
+    const captchaEnabled = asBool(conf["CERT_CAPTCHA_ENABLED"], false);
+    const baseCaptchaEnabled = asBool(conf["BASE_CAPTCHA_ENABLED"], false);
+    const captchaProvider = conf["CERT_CAPTCHA_PROVIDER"] ?? "turnstile";
     // 站点端使用 Site Key；新键 SITE_KEYS 优先，回退旧键 CERT_CAPTCHA_SITE_KEY
-    const captchaSiteKey =
-        (await safeRead(env, "SITE_KEYS")) ||
-        (await safeRead(env, "CERT_CAPTCHA_SITE_KEY")) ||
-        "";
+    const captchaSiteKey = conf["SITE_KEYS"] || conf["CERT_CAPTCHA_SITE_KEY"] || "";
 
     const payload: BootstrapResult = {
         initialized,

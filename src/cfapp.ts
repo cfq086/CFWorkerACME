@@ -24,12 +24,24 @@ index.app.use("*", async (c, next) => {
 // ⚠️ 必须在 probe-guard 中间件**之后**注册：Hono 按注册顺序执行，
 //    否则敏感路径会被这里兜底成 200。
 // ⚠️ 不要给入口 HTML 加长缓存：否则发版后用户会一直拿旧的 index.html。
-// ⚠️ 也**不要**在这里改响应头：`env.ASSETS.fetch()` 返回的是网络响应，其 headers guard 是
-//    **immutable**，`res.headers.set(...)` 会抛 TypeError；catch-all 里没人接 →
-//    所有未命中静态的 GET（/certs、/order/xxx、/favicon.svg）全部 500（2026-10-21 踩过）。
-//    assets 层自带 `Cache-Control: public, max-age=0, must-revalidate` + ETag，入口 HTML 够用。
+// ⚠️ **必须读完再返回，不能把 `env.ASSETS.fetch()` 的流直接转发**（2026-10-21 踩过）：
+//    · 直接 `return res` → 响应变成 `Transfer-Encoding: chunked` 且**没有 Content-Length**，
+//      浏览器要等上游把流关掉才算传完。实测出现过「3KB 的 HTML 下载 1.2 分钟」的挂起。
+//    · 改成读 `arrayBuffer()` 后重建 Response，明确带 `Content-Length`，浏览器下完立即结束。
+//    · 顺带解决另一个坑：`fetch()` 返回的响应 headers 是 **immutable**，直接 `res.headers.set()`
+//      会抛 TypeError（catch-all 里没人接 → 所有深链接 500）。
+//    index.html 只有 20KB 左右，`arrayBuffer()` 的开销可以忽略。
 index.app.get("*", async (c) => {
-    return await c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
+    const res = await c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
+    const buf = await res.arrayBuffer();
+    return new Response(buf, {
+        status: res.status,
+        headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": String(buf.byteLength),
+            "Cache-Control": "public, max-age=0, must-revalidate",
+        },
+    });
 });
 // export default index.app
 index.app.fire()
