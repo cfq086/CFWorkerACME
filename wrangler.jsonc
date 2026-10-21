@@ -5,6 +5,21 @@
   "compatibility_date": "2025-03-10",
   "workers_dev": false,
   "preview_urls": false,
+  // 静态资源交给 Cloudflare 资产层（Workers Static Assets）：
+  //   - 自动 gzip/brotli 压缩、自动 ETag 与 Cache-Control、走边缘 CDN 缓存
+  //   - 静态请求**不进入 Worker**（不消耗 Worker 请求数，也没有冷启动开销）
+  // 之前用 `serveStatic` + `__STATIC_CONTENT_MANIFEST` 从 Worker 脚本里读资产，
+  // 响应没有缓存头也没有压缩，首屏 20+ 个资源每个都要穿透到 Worker，导致首访 30 秒级。
+  //
+  // ⚠️ `not_found_handling: "none"`（而不是 "single-page-application"）：
+  //    未命中静态文件时交给 Worker 兜底（下面 cfapp.ts 的 SPA fallback）。
+  //    若用 spa，assets 层会在 Worker **之前**就把 /.env 这类探测路径返回 index.html（200），
+  //    把 probe-guard 中间件整个绕过。
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "none"
+  },
   "compatibility_flags": [
     "nodejs_compat",
     "no_strict_crypto_checks"
@@ -39,9 +54,9 @@
     "ZRO_keyMC": "",
     "ZRO_KeyTS": ""
   },
-  "site": {
-    "bucket": "./public"
-  },
+  // ⚠️ 已废弃的 Workers Sites 配置（"site": {"bucket": "./public"}）必须删掉：
+  //    新版 `assets` 与 `site` 不能同时存在，wrangler 直接报错拒绝部署。
+  //    静态资源现在完全由上面的 `assets` 负责。
   "d1_databases": [
     {
       "binding": "DB_CF",

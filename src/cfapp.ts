@@ -1,5 +1,3 @@
-import {serveStatic} from 'hono/cloudflare-workers' // @ts-ignore
-import manifest from '__STATIC_CONTENT_MANIFEST'
 import * as index from './index'
 import * as certs from './certs'
 import * as notify from './notify'
@@ -17,13 +15,20 @@ index.app.use("*", async (c, next) => {
     await next();
 });
 
-// SPA fallback: 尝试访问请求路径对应的静态文件，失败后回退到 index.html
-index.app.use("*", serveStatic({manifest: manifest, root: "./"}));
-index.app.get("*", serveStatic({
-    manifest: manifest,
-    root: "./",
-    path: "index.html",
-} as any));
+// SPA fallback ###############################################################################
+// 静态文件由 Cloudflare 资产层（Workers Static Assets）**直接**返回 —— 带压缩、ETag 与 CDN 缓存，
+// 且完全不进 Worker（没有冷启动开销）。能走到这里说明没有命中任何静态文件，
+// 分两种情况：
+//   ① SPA 路由（/certs、/order/xxx、/admin/...）→ 返回入口 HTML，交给前端路由
+//   ② 真的不存在 → 同样返回入口 HTML（由前端自己出 404 页）
+// ⚠️ 必须在 probe-guard 中间件**之后**注册：Hono 按注册顺序执行，
+//    否则敏感路径会被这里兜底成 200。
+// ⚠️ 不要给入口 HTML 加长缓存：否则发版后用户会一直拿旧的 index.html。
+index.app.get("*", async (c) => {
+    const res = await c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
+    res.headers.set("Cache-Control", "no-cache");
+    return res;
+});
 // export default index.app
 index.app.fire()
 

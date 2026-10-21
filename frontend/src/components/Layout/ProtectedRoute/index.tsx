@@ -45,7 +45,7 @@ export default function ProtectedRoute({
 
   // 首次检查尚未完成，显示 loading
   if (!checked || loading) {
-    return <Loading full text="加载中" />;
+    return <Loading full text="加载中 - 首次加载较慢，请耐心等待。" />;
   }
 
   if (!isLoggedIn) {
