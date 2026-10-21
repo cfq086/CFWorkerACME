@@ -14,7 +14,7 @@ export interface LoadingProps {
  * 加载态组件 —— 颜文字 + 文案，比传统转圈更有温度
  */
 export default function Loading({
-  text = '加载中',
+  text = '加载中 - 首次加载较慢，请耐心等待',
   full = false,
   size = 'md',
   className,
